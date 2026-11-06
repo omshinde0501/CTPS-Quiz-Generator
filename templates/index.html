@@ -1,1 +1,86 @@
 
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CTPS Quiz Generator</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <header>
+        <div class="brand-box">
+            <span class="brand-mark">Q</span>
+            <div>
+                <h1>CTPS Quiz Generator</h1>
+                <p>Turn your study notes into practice material</p>
+            </div>
+        </div>
+    </header>
+
+    <main>
+        <section class="upload-box">
+            <div class="section-icon">↑</div>
+            <h2>Upload Your Notes</h2>
+            <p class="muted">Choose a text-based PDF or a TXT file.</p>
+            <form id="uploadForm" method="post" enctype="multipart/form-data">
+                <label class="file-label" for="notes">Select your study file</label>
+                <input type="file" id="notes" name="notes" accept=".pdf,.txt" required>
+                <p class="file-hint">Supported formats: PDF and TXT</p>
+                <div class="actions">
+                    <button formaction="{{ url_for('generate', kind='mcq') }}" class="primary-button">Generate MCQs</button>
+                    <button formaction="{{ url_for('generate', kind='flashcards') }}" class="secondary-button">Generate Flashcards</button>
+                </div>
+            </form>
+            {% if status %}<p class="status {% if error %}error{% endif %}">{{ status }}</p>{% endif %}
+        </section>
+
+        {% if results and mode %}
+        <section class="results">
+            <div class="result-top">
+                <div>
+                    <span class="eyebrow">YOUR STUDY MATERIAL</span>
+                    <h2>{% if mode == 'mcq' %}Generated MCQs{% else %}Generated Flashcards{% endif %}</h2>
+                </div>
+                <a class="print-button" href="{{ url_for('download_pdf') }}">Download as PDF</a>
+            </div>
+
+            {% if mode == 'mcq' %}
+                <p class="quality-note">{{ results.questions|length }} questions generated. Correct answers are revealed when you select an option.</p>
+                {% for q in results.questions %}
+                {% set q_index = loop.index0 %}
+                <article class="question-card">
+                    <h3><span class="question-number">{{ loop.index }}</span>{{ q.question }}</h3>
+                    <div class="options">
+                        {% for option in q.options %}
+                        <form class="option-form" method="post" action="{{ url_for('answer') }}">
+                            <input type="hidden" name="question_index" value="{{ q_index }}">
+                            <button class="option-button {% if q.checked and option == q.answer %}correct{% elif q.checked and option == q.selected %}incorrect{% endif %}" type="submit" name="choice" value="{{ option }}" {% if q.checked %}disabled{% endif %}>
+                                <span class="option-letter">{{ 'ABCD'[loop.index0] }}</span>{{ option }}
+                                {% if q.checked and option == q.answer %}<span class="feedback">Correct</span>{% elif q.checked and option == q.selected %}<span class="feedback">Your choice</span>{% endif %}
+                            </button>
+                        </form>
+                        {% endfor %}
+                    </div>
+                    {% if q.checked %}<p class="answer-line">{% if q.selected == q.answer %}Correct! Well done.{% else %}Correct answer: {{ q.answer }}{% endif %}</p>{% endif %}
+                </article>
+                {% endfor %}
+            {% else %}
+                <p class="quality-note">Think of the meaning first, then reveal the answer.</p>
+                {% for card in results.cards %}
+                <article class="flashcard">
+                    <span class="card-label">FLASHCARD {{ loop.index }}</span>
+                    <h3>{{ card.front }}</h3>
+                    <form method="post" action="{{ url_for('reveal', index=loop.index0) }}">
+                        <button class="reveal-button" type="submit">{% if card.shown %}Hide Answer{% else %}Show Answer{% endif %}</button>
+                    </form>
+                    {% if card.shown %}<p class="card-answer">{{ card.back }}</p>{% endif %}
+                </article>
+                {% endfor %}
+            {% endif %}
+        </section>
+        {% endif %}
+    </main>
+    <footer>CTPS Quiz Generator <span>Rule-based system · No AI API required</span></footer>
+</body>
+</html>
