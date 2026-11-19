@@ -31,11 +31,11 @@
                     <button formaction="{{ url_for('generate', kind='mcq') }}" class="primary-button">Generate MCQs</button>
                     <button formaction="{{ url_for('generate', kind='flashcards') }}" class="secondary-button">Generate Flashcards</button>
                 </div>
-            </form>{% if error %}
-<p class="status error">{{ error }}</p>
-{% elif status %}
-<p class="status">{{ status }}</p>
+            </form>
+{% if status %}
+<p class="status {% if error %}error{% endif %}">{{ status }}</p>
 {% endif %}
+
         </section>
 
         {% if results and mode %}
