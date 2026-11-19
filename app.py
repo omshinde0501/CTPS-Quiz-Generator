@@ -1,5 +1,5 @@
 
-import os, io, json, uuid, random, tempfile, html
+import os, io, json, uuid, random, tempfile, time, html
 import fitz
 from flask import Flask, render_template, request, redirect, url_for, session, send_file
 from google import genai
@@ -14,8 +14,10 @@ from reportlab.lib.units import mm
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "ctps-quiz-generator-change-this-key")
 app.config["MAX_CONTENT_LENGTH"] = 18 * 1024 * 1024
+
+PRIMARY_MODEL = "gemini-3.8-flash"
+FALLBACK_MODEL = "gemini-3.1-flash-lite"
 RESULTS_STORE = {}
-GEMINI_MODEL = "gemini-3.8-flash"
 
 SCHEMA = {
     "type": "object",
@@ -26,7 +28,10 @@ SCHEMA = {
                 "type": "object",
                 "properties": {
                     "question": {"type": "string"},
-                    "options": {"type": "array", "items": {"type": "string"}},
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
                     "answer": {"type": "string"},
                     "explanation": {"type": "string"}
                 },
@@ -48,242 +53,322 @@ SCHEMA = {
     "required": ["questions", "flashcards"]
 }
 
-def get_saved_results():
-    return RESULTS_STORE.get(session.get("data_id"), {})
 
 def read_upload(file):
-    name, data = (file.filename or "").lower(), file.read()
+    name = (file.filename or "").lower()
+    data = file.read()
+
     if not data:
         raise ValueError("The uploaded file is empty.")
+
     if name.endswith(".txt"):
-        text = data.decode("utf-8-sig", errors="replace")
-        if len(text.strip()) < 40:
-            raise ValueError("The TXT file contains too little study material.")
-        return {"kind": "txt", "content": text}
+        text = data.decode("utf-8", errors="ignore").strip()
+        if not text:
+            raise ValueError("No readable text found in this TXT file.")
+        return "text", text
+
     if name.endswith(".pdf"):
         try:
             doc = fitz.open(stream=data, filetype="pdf")
-            if doc.is_encrypted or not doc.page_count:
-                raise ValueError("The PDF is empty or password-protected.")
+            if doc.is_encrypted:
+                doc.close()
+                raise ValueError("Password-protected PDFs are not supported.")
+            text = "\n".join(page.get_text() for page in doc).strip()
             doc.close()
+            if not text:
+                raise ValueError("This PDF has no selectable text. Scanned PDFs need OCR.")
+            return "text", text[:70000]
         except ValueError:
             raise
         except Exception:
-            raise ValueError("The uploaded PDF is invalid or damaged.")
-        return {"kind": "pdf", "content": data}
+            raise ValueError("Could not read this PDF. Please try another file.")
+
     raise ValueError("Please upload a PDF or TXT file.")
 
-def generate_material(upload, kind):
+
+def generate_with_retry(client, contents, config):
+    models = [PRIMARY_MODEL, FALLBACK_MODEL]
+    last_error = None
+
+    for model in models:
+        for attempt in range(3):
+            try:
+                return client.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=config
+                )
+            except Exception as e:
+                last_error = e
+                error = str(e).upper()
+
+                if "503" in error or "UNAVAILABLE" in error:
+                    if attempt < 2:
+                        time.sleep(2 ** (attempt + 1))
+                        continue
+                    break
+
+                if "429" in error or "RESOURCE_EXHAUSTED" in error:
+                    raise Exception(
+                        "Gemini free-tier limit reached. Please wait and try again."
+                    )
+
+                if "401" in error or "403" in error or "API_KEY" in error:
+                    raise Exception("Gemini API key is invalid or not authorized.")
+
+                if "404" in error or "NOT_FOUND" in error:
+                    break
+
+                raise Exception("Gemini error: " + str(e)[:300])
+
+    raise Exception(
+        "Gemini is temporarily overloaded. Both models failed. "
+        "Please wait a little and try again. Details: " + str(last_error)[:180]
+    )
+
+
+def generate_material(file_type, source, kind):
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
-        raise ValueError("Gemini API key is missing. Add GEMINI_API_KEY in Render.")
-
-    if kind == "mcq":
-        prompt = """Create up to 20 high-quality MCQs strictly from the uploaded material.
-Each question must have exactly four distinct options and one correct answer.
-Use plausible, relevant distractors. Questions must be clear, logical and non-repetitive.
-Include a short explanation. Do not invent facts or use outside knowledge.
-Generate fewer questions rather than poor ones. Return an empty flashcards array."""
-    else:
-        prompt = """Create up to 40 useful flashcards from the uploaded material.
-Each card must have a clear question or term on the front and an accurate,
-concise answer on the back. Cover important concepts without repetition.
-Do not invent facts or use outside knowledge. Return an empty questions array."""
+        raise ValueError("GEMINI_API_KEY is missing from Render environment variables.")
 
     client = genai.Client(api_key=key)
-    uploaded, temp = None, None
+
+    if kind == "mcq":
+        task = """
+Create 10 high-quality multiple-choice questions from the supplied study material.
+Each question must have exactly 4 distinct options and one unambiguously correct answer.
+Use only facts supported by the material. Avoid vague, repetitive, trivial or illogical questions.
+Make distractors realistic but clearly incorrect. Cover different topics in the material.
+The answer must exactly match one of the four options.
+Provide a short explanation based on the material.
+Return questions in the questions array. Leave flashcards empty.
+"""
+    else:
+        task = """
+Create 15 useful study flashcards from the supplied study material.
+Each front should contain one clear question or concept.
+Each back should contain a concise, accurate answer based only on the material.
+Avoid duplicate or overly broad cards.
+Return cards in the flashcards array. Leave questions empty.
+"""
+
+    contents = [
+        task,
+        "Study material:\n" + source[:70000]
+    ]
+
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_json_schema=SCHEMA,
+        temperature=0.2,
+        max_output_tokens=8192
+    )
 
     try:
-        if upload["kind"] == "pdf":
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-                f.write(upload["content"])
-                temp = f.name
-            uploaded = client.files.upload(file=temp)
-            contents = [prompt, uploaded]
-        else:
-            contents = [prompt, "\nSTUDY MATERIAL:\n", upload["content"][:70000]]
-
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_json_schema=SCHEMA,
-                temperature=0.2,
-                max_output_tokens=8192
-            )
-        )
+        response = generate_with_retry(client, contents, config)
         if not response.text:
             raise ValueError("Gemini returned an empty response.")
         return json.loads(response.text)
-
-    except ValueError:
-        raise
-    except Exception as e:
-        msg = str(e).lower()
-        if any(x in msg for x in ["429", "quota", "resource_exhausted"]):
-            raise ValueError("Gemini free usage limit reached. Please try again later.")
-        if any(x in msg for x in ["401", "403", "api key", "permission"]):
-            raise ValueError("Gemini authentication failed. Check your API key.")
-        if "404" in msg:
-            raise ValueError("Gemini model unavailable. Check the model name or API access.")
-        print("GEMINI ERROR:", e)
-        raise ValueError("Generation failed. Please try another file.")
     finally:
-        if uploaded:
-            try:
-                client.files.delete(name=uploaded.name)
-            except Exception:
-                pass
-        if temp and os.path.exists(temp):
-            os.remove(temp)
         try:
             client.close()
         except Exception:
             pass
 
-def prepare_mcqs(items):
-    result, seen = [], set()
-    for q in items[:20]:
-        try:
-            question = str(q["question"]).strip()
-            answer = str(q["answer"]).strip()
-            options = [str(x).strip() for x in q["options"] if str(x).strip()]
-            if len(options) != 4 or len({x.casefold() for x in options}) != 4:
-                continue
-            correct = next((x for x in options if x.casefold() == answer.casefold()), None)
-            if not correct or len(question) < 10 or question.casefold() in seen:
-                continue
-            seen.add(question.casefold())
-            random.shuffle(options)
-            result.append({
-                "question": question, "answer": correct, "options": options,
-                "explanation": str(q.get("explanation", "")),
-                "selected": None, "checked": False
-            })
-        except (KeyError, TypeError):
-            continue
-    return result
 
-def prepare_cards(items):
-    result, seen = [], set()
-    for card in items[:40]:
-        try:
-            front, back = str(card["front"]).strip(), str(card["back"]).strip()
-            if not front or not back or front.casefold() in seen:
-                continue
-            seen.add(front.casefold())
-            result.append({"front": front, "back": back, "shown": False})
-        except (KeyError, TypeError):
+def prepare_mcqs(data):
+    output = []
+    for q in data.get("questions", []):
+        question = str(q.get("question", "")).strip()
+        answer = str(q.get("answer", "")).strip()
+        options = [str(x).strip() for x in q.get("options", []) if str(x).strip()]
+
+        if not question or not answer or len(options) != 4:
             continue
-    return result
+        if len(set(options)) != 4 or answer not in options:
+            continue
+
+        random.shuffle(options)
+        output.append({
+            "question": question,
+            "answer": answer,
+            "options": options,
+            "explanation": str(q.get("explanation", "")).strip(),
+            "selected": None,
+            "checked": False
+        })
+
+    if not output:
+        raise ValueError("No valid MCQs were generated. Try another file.")
+    return output
+
+
+def prepare_cards(data):
+    output, seen = [], set()
+    for card in data.get("flashcards", []):
+        front = str(card.get("front", "")).strip()
+        back = str(card.get("back", "")).strip()
+        if front and back and front.lower() not in seen:
+            seen.add(front.lower())
+            output.append({"front": front, "back": back, "shown": False})
+
+    if not output:
+        raise ValueError("No valid flashcards were generated. Try another file.")
+    return output
+
+
+def get_results():
+    return RESULTS_STORE.get(session.get("result_id"), {})
+
 
 @app.route("/")
-def home():
-    saved = get_saved_results()
-    return render_template("index.html", results=saved.get("results"), mode=saved.get("mode"), status=None)
+def index():
+    return render_template(
+        "index.html",
+        results=get_results(),
+        mode=session.get("mode"),
+        status=session.get("status", ""),
+        error=session.get("error", "")
+    )
+
 
 @app.route("/generate/<kind>", methods=["POST"])
 def generate(kind):
     if kind not in ("mcq", "flashcards"):
-        return redirect(url_for("home"))
-    file = request.files.get("notes")
-    if not file or not file.filename:
-        return render_template("index.html", status="Please upload your notes first.", error=True)
-    try:
-        upload = read_upload(file)
-        generated = generate_material(upload, kind)
-        if kind == "mcq":
-            questions = prepare_mcqs(generated.get("questions", []))
-            if not questions:
-                raise ValueError("No valid MCQs could be generated. Try a more detailed file.")
-            results = {"questions": questions, "cards": []}
-            message = f"Generated {len(questions)} AI-powered MCQs."
-        else:
-            cards = prepare_cards(generated.get("flashcards", []))
-            if not cards:
-                raise ValueError("No useful flashcards could be generated. Try another file.")
-            results = {"questions": [], "cards": cards}
-            message = f"Generated {len(cards)} AI-powered flashcards."
+        return redirect(url_for("index"))
 
-        data_id = str(uuid.uuid4())
-        RESULTS_STORE[data_id] = {"results": results, "mode": kind}
-        session["data_id"] = data_id
-        return render_template("index.html", results=results, mode=kind, status=message)
+    try:
+        file = request.files.get("file")
+        if not file or not file.filename:
+            raise ValueError("Please select a PDF or TXT file.")
+
+        file_type, source = read_upload(file)
+        data = generate_material(file_type, source, kind)
+
+        if kind == "mcq":
+            results = {"questions": prepare_mcqs(data), "cards": []}
+        else:
+            results = {"questions": [], "cards": prepare_cards(data)}
+
+        result_id = str(uuid.uuid4())
+        RESULTS_STORE[result_id] = results
+        session["result_id"] = result_id
+        session["mode"] = kind
+        session["status"] = "Generated successfully!"
+        session["error"] = ""
+
     except Exception as e:
-        print("GENERATION ERROR:", e)
-        return render_template("index.html", status=str(e), error=True)
+        session["error"] = str(e)
+        session["status"] = ""
+
+    return redirect(url_for("index"))
+
 
 @app.route("/answer", methods=["POST"])
 def answer():
-    saved = get_saved_results()
-    data = saved.get("results", {})
-    questions = data.get("questions", [])
-    try:
-        i = int(request.form.get("question_index", -1))
-    except ValueError:
-        i = -1
-    if 0 <= i < len(questions):
-        choice = request.form.get("choice", "")
-        if choice in questions[i]["options"]:
-            questions[i]["selected"] = choice
-            questions[i]["checked"] = True
-            RESULTS_STORE[session.get("data_id")]["results"] = data
-    return redirect(url_for("home"))
+    results = get_results()
+    questions = results.get("questions", [])
 
-@app.route("/reveal/<int:index>", methods=["POST"])
+    for i, q in enumerate(questions):
+        selected = request.form.get(f"answer_{i}")
+        q["selected"] = selected
+        q["checked"] = True
+
+    session["status"] = "Answers submitted!"
+    return redirect(url_for("index"))
+
+
+@app.route("/reveal/<int:index>")
 def reveal(index):
-    saved = get_saved_results()
-    data = saved.get("results", {})
-    cards = data.get("cards", [])
+    results = get_results()
+    cards = results.get("cards", [])
+
     if 0 <= index < len(cards):
-        cards[index]["shown"] = not cards[index].get("shown", False)
-        RESULTS_STORE[session.get("data_id")]["results"] = data
-    return redirect(url_for("home"))
+        cards[index]["shown"] = not cards[index]["shown"]
+
+    return redirect(url_for("index"))
+
 
 @app.route("/download-pdf")
 def download_pdf():
-    saved = get_saved_results()
-    data, mode = saved.get("results", {}), saved.get("mode")
-    if not data or mode not in ("mcq", "flashcards"):
-        return redirect(url_for("home"))
-
+    results = get_results()
+    mode = session.get("mode")
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=18*mm, leftMargin=18*mm,
-                            topMargin=18*mm, bottomMargin=18*mm)
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=18 * mm,
+        leftMargin=18 * mm,
+        topMargin=18 * mm,
+        bottomMargin=18 * mm
+    )
+
     styles = getSampleStyleSheet()
-    title = ParagraphStyle("QuizTitle", parent=styles["Title"], alignment=TA_CENTER,
-                           textColor=colors.HexColor("#174b86"), spaceAfter=14)
-    body = styles["BodyText"]
-    story = [Paragraph("CTPS Quiz Generator", title), Spacer(1, 5)]
+    title_style = ParagraphStyle(
+        "TitleCustom",
+        parent=styles["Title"],
+        alignment=TA_CENTER,
+        textColor=colors.HexColor("#1769aa"),
+        spaceAfter=16
+    )
+    question_style = ParagraphStyle(
+        "QuestionCustom",
+        parent=styles["Normal"],
+        fontSize=11,
+        leading=16,
+        spaceAfter=6
+    )
+    body_style = ParagraphStyle(
+        "BodyCustom",
+        parent=styles["Normal"],
+        fontSize=10,
+        leading=14,
+        spaceAfter=4
+    )
+
+    story = [Paragraph("CTPS Study Material", title_style)]
 
     if mode == "mcq":
-        for i, q in enumerate(data.get("questions", []), 1):
-            parts = [Paragraph(f"<b>Q{i}. {html.escape(q['question'])}</b>", body), Spacer(1, 5)]
-            for letter, option in zip("ABCD", q["options"]):
-                parts.append(Paragraph(f"{letter}. {html.escape(option)}", body))
-            parts.append(Paragraph(
-                f"<font color='#287653'><b>Correct answer: {html.escape(q['answer'])}</b></font>", body
+        for i, q in enumerate(results.get("questions", []), 1):
+            items = [
+                Paragraph(f"<b>Q{i}. {html.escape(q['question'])}</b>", question_style)
+            ]
+            for option in q["options"]:
+                mark = "✓ " if option == q["answer"] else ""
+                items.append(Paragraph(
+                    html.escape(mark + option), body_style
+                ))
+
+            items.append(Paragraph(
+                "<b>Answer:</b> " + html.escape(q["answer"]), body_style
             ))
             if q.get("explanation"):
-                parts.append(Paragraph("<b>Explanation:</b> " + html.escape(q["explanation"]), body))
-            parts.append(Spacer(1, 12))
-            story.append(KeepTogether(parts))
-    else:
-        for i, card in enumerate(data.get("cards", []), 1):
-            story.append(KeepTogether([
-                Paragraph(f"<b>{i}. {html.escape(card['front'])}</b>", body),
-                Paragraph(html.escape(card["back"]), body), Spacer(1, 12)
-            ]))
+                items.append(Paragraph(
+                    "<b>Explanation:</b> " + html.escape(q["explanation"]),
+                    body_style
+                ))
+            items.append(Spacer(1, 8))
+            story.append(KeepTogether(items))
 
+    else:
+        for i, card in enumerate(results.get("cards", []), 1):
+            story.append(KeepTogether([
+                Paragraph(f"<b>Card {i}: {html.escape(card['front'])}</b>", question_style),
+                Paragraph(html.escape(card["back"]), body_style),
+                Spacer(1, 10)
+            ]))
     doc.build(story)
     buffer.seek(0)
-    return send_file(buffer, as_attachment=True, download_name="CTPS_Practice_Material.pdf",
-                     mimetype="application/pdf")
-
+    return send_file(
+        buffer,
+        as_attachment=True,
+        download_name="CTPS_Study_Material.pdf",
+        mimetype="application/pdf"
+    )
 @app.errorhandler(413)
-def file_too_large(error):
-    return render_template("index.html", status="File too large. Upload a file below 18 MB.", error=True), 413
-
+def too_large(e):
+    return "File is too large. Maximum size is 18 MB.", 413
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
