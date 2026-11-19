@@ -1,12 +1,14 @@
 
-from flask import Flask, render_template, request, redirect, url_for, session, send_file
-import fitz
 import io
 import random
 import re
 import uuid
 from collections import OrderedDict
+
+import fitz
+from flask import Flask, render_template, request, redirect, url_for, session, send_file
 from html import escape
+
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
@@ -14,29 +16,34 @@ from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, KeepTogether
 from reportlab.lib.units import mm
 
+
 app = Flask(__name__)
 app.secret_key = "ctps-quiz-generator-change-this-key"
 RESULTS_STORE = {}
 
-INVALID_TERMS = {
-    "what", "which", "who", "when", "where", "why", "how",
-    "it", "they", "we", "you", "this", "that", "these", "those",
-    "the", "a", "an", "is", "are", "was", "were",
-    "system", "method", "process", "example", "following",
-    "concept", "thing", "way", "type", "kind", "term", "use",
-    "introduction", "conclusion", "contents", "references",
-    "applications", "advantages", "disadvantages", "working",
-    "overview", "objectives", "description", "notes", "chapter",
-    "unit", "module", "definition", "types", "steps"
-}
-
 STOP_WORDS = {
     "the", "and", "for", "that", "this", "with", "from", "into",
-    "are", "which", "used", "can", "its", "their", "when",
-    "where", "often", "also", "has", "have", "was", "were",
-    "been", "being", "such", "than", "then", "they", "them",
-    "these", "those", "will", "would", "should", "could",
-    "while", "through", "using", "use", "used", "one"
+    "are", "which", "used", "use", "its", "their", "they", "them",
+    "can", "may", "will", "would", "should", "could", "also",
+    "such", "when", "where", "while", "through", "using", "often",
+    "than", "then", "have", "has", "been", "being", "was", "were",
+    "each", "more", "most", "some", "many", "other", "another",
+    "very", "about", "because", "these", "those", "both", "only",
+    "one", "two", "first", "second", "following", "example",
+    "which", "what", "how", "why", "who"
+}
+
+BAD_HEADINGS = {
+    "contents", "table of contents", "references", "bibliography",
+    "index", "acknowledgements", "learning objectives",
+    "introduction", "conclusion", "overview", "summary",
+    "programming fundamentals", "digital electronics",
+    "computational thinking", "problem solving",
+    "advantages", "disadvantages", "applications",
+    "examples", "definition", "definitions", "unit",
+    "chapter", "module", "semester", "subject",
+    "working", "description", "notes", "types", "steps",
+    "classification", "history", "syllabus"
 }
 
 
@@ -49,36 +56,39 @@ def read_file(file):
     data = file.read()
 
     if name.endswith(".txt"):
-        return data.decode("utf-8", errors="ignore")
+        return data.decode("utf-8-sig", errors="ignore")
 
     if name.endswith(".pdf"):
         try:
             with fitz.open(stream=data, filetype="pdf") as document:
                 if document.is_encrypted and not document.authenticate(""):
                     raise ValueError(
-                        "This PDF is password-protected. Please upload an unlocked PDF."
+                        "This PDF is password-protected. Upload an unlocked PDF."
                     )
-                return "\n".join(
+
+                # Form-feed preserves page boundaries for extraction.
+                return "\n\f\n".join(
                     page.get_text("text", sort=True)
                     for page in document
                 )
         except fitz.FileDataError:
-            raise ValueError(
-                "The uploaded PDF could not be read. Please try another PDF."
-            )
+            raise ValueError("The PDF could not be opened. Try another file.")
 
     raise ValueError("Please choose a PDF or TXT file.")
 
 
-def is_unwanted_line(line):
-    text = line.strip()
-    lower = text.lower()
+def is_bad_heading(text):
+    text = re.sub(r"\s+", " ", text).strip()
+    lower = text.casefold().rstrip(" .:")
 
-    if len(text) < 3:
+    if not text or len(text) < 3:
+        return True
+
+    if lower in BAD_HEADINGS:
         return True
 
     if re.match(
-        r"^(unit|chapter|module|semester|subject)\s*[-:\d]",
+        r"^(unit|chapter|module|semester|subject)\s*[-:#\d]",
         text, re.I
     ):
         return True
@@ -86,25 +96,12 @@ def is_unwanted_line(line):
     if re.match(r"^(page\s*)?\d+(\s*of\s*\d+)?$", text, re.I):
         return True
 
-    unwanted = (
-        r"^(how to use|instructions?|learning objectives|contents|"
-        r"table of contents|index|references|bibliography|"
-        r"acknowledgements?)\s*[:.]?$"
-    )
-
-    if re.match(unwanted, text, re.I):
+    if re.fullmatch(r"[\d\s./-]+", text):
         return True
 
     if re.match(
-        r"^(read|refer to|study|follow|go through|"
-        r"these notes|this unit|in this unit)\b",
-        lower
-    ):
-        return True
-
-    if re.match(
-        r"^(quiz generator|generated notes|study notes)$",
-        lower
+        r"^(read|refer to|study|follow|go through)\b",
+        text, re.I
     ):
         return True
 
@@ -112,89 +109,128 @@ def is_unwanted_line(line):
 
 
 def clean_study_text(text):
-    lines = []
+    cleaned = []
 
-    for line in text.splitlines():
-        line = re.sub(r"\s+", " ", line).strip()
-
-        if line and not is_unwanted_line(line):
-            lines.append(line)
-
-    return "\n".join(lines)
-
-
-def get_sentences(text):
-    lines = text.splitlines()
-    paragraphs = []
-    current = []
-
-    def flush():
-        if current:
-            paragraphs.append(" ".join(current).strip())
-            current.clear()
-
-    for line in lines:
+    for line in text.replace("\x00", " ").splitlines():
         line = re.sub(r"\s+", " ", line).strip()
 
         if not line:
-            flush()
+            cleaned.append("")
             continue
 
-        # Preserve short headings separately.
-        is_heading = (
-            len(line) <= 65
-            and len(line.split()) <= 8
-            and not re.search(r"[.!?]", line)
-            and not re.match(
-                r"^(a|an|the)\s+\w+\s+(is|are|means)\b",
-                line, re.I
-            )
-        )
+        if re.match(
+            r"^(unit|chapter|module|semester)\s*[-:#\d]",
+            line, re.I
+        ):
+            continue
 
-        if is_heading:
-            flush()
-            paragraphs.append(line)
-        else:
+        if re.match(r"^(page\s*)?\d+(\s*of\s*\d+)?$", line, re.I):
+            continue
+
+        if line.casefold().rstrip(" .:") in BAD_HEADINGS:
+            continue
+
+        cleaned.append(line)
+
+    return "\n".join(cleaned)
+
+
+def get_blocks(text):
+    """
+    Reconstruct paragraphs from PDF lines while preserving headings,
+    question prompts and page boundaries.
+    """
+    blocks = []
+
+    for page_number, page in enumerate(text.split("\f")):
+        current = []
+
+        def flush():
+            if current:
+                value = " ".join(current).strip()
+                if len(value) >= 8:
+                    blocks.append({
+                        "text": value,
+                        "page": page_number
+                    })
+                current.clear()
+
+        for raw_line in page.splitlines():
+            line = re.sub(r"\s+", " ", raw_line).strip()
+
+            if not line:
+                flush()
+                continue
+
+            # A question-style heading is useful for identifying
+            # the concept explained immediately after it.
+            if re.match(
+                r"^(what|define|explain)\s+(is|are|the)\b",
+                line, re.I
+            ) and len(line) < 120:
+                flush()
+                blocks.append({
+                    "text": line,
+                    "page": page_number
+                })
+                continue
+
+            # Short unpunctuated lines are likely slide headings.
+            heading = (
+                len(line) <= 65
+                and len(line.split()) <= 8
+                and not re.search(r"[.!?]", line)
+                and not re.match(
+                    r"^(a|an|the)\s+\w+\s+(is|are|means)\b",
+                    line, re.I
+                )
+            )
+
+            if heading:
+                flush()
+                blocks.append({
+                    "text": line,
+                    "page": page_number
+                })
+                continue
+
+            # Avoid joining a new sentence to a completed one.
             if current and re.search(r"[.!?]$", current[-1]):
                 flush()
+
             current.append(line)
 
-    flush()
+        flush()
 
-    sentences = []
+    return blocks
 
-    for paragraph in paragraphs:
-        parts = re.split(
-            r"(?<=[.!?])\s+(?=[A-Z0-9])",
-            paragraph
-        )
 
-        for part in parts:
-            part = part.strip()
-
-            if 12 < len(part) < 700:
-                sentences.append(part)
-
-    return sentences
+def clean_term(term):
+    term = re.sub(r"^\d+[\s.)-]+", "", term).strip()
+    term = re.sub(r"^(a|an|the)\s+", "", term, flags=re.I)
+    return re.sub(r"\s+", " ", term).strip(" ,;:-.")
 
 
 def valid_term(term):
-    term = term.strip(" ,;:-.")
+    term = clean_term(term)
     words = re.findall(r"[A-Za-z][A-Za-z0-9+#.-]*", term)
 
     if not words or len(words) > 7 or len(term) > 65:
         return False
 
-    if term.casefold() in INVALID_TERMS:
+    if term.casefold() in BAD_HEADINGS:
         return False
 
-    if words[0].casefold() in INVALID_TERMS:
+    if words[0].casefold() in STOP_WORDS:
         return False
 
     if re.search(
-        r"\b(is|are|was|were|what|which|how|why|when|where)\b",
+        r"\b(is|are|was|were|what|which|who|how|why|when|where)\b",
         term, re.I
     ):
+        return False
+
+    if re.search(r"[?=]", term):
         return False
 
     if re.match(
@@ -203,18 +239,61 @@ def valid_term(term):
     ):
         return False
 
+    if len(words) == 1 and len(words[0]) < 3:
+        return False
+
     return True
 
 
-def extract_definition(sentence):
-    line = re.sub(r"^[•\-*]\s*", "", sentence).strip()
-    line = re.sub(r"^\d+[\s.)-]+", "", line).strip()
+def make_item(term, meaning, page, source):
+    term = clean_term(term)
+    meaning = re.sub(r"\s+", " ", meaning).strip()
+    meaning = re.sub(r"^[,;:\-\s]+", "", meaning)
+    meaning = re.sub(r"[.!?]+$", "", meaning).strip()
 
-    if is_unwanted_line(line) or "?" in line:
+    if not valid_term(term):
+        return None
+
+    if len(meaning) < 20 or len(meaning.split()) < 5:
+        return None
+
+    if "?" in meaning:
+        return None
+
+    if re.match(
+        r"^(what|which|who|when|where|why|how)\b",
+        meaning, re.I
+    ):
+        return None
+
+    if re.match(
+        r"^(example|for example|note|figure|table|"
+        r"source code|references)\b",
+        meaning, re.I
+    ):
+        return None
+
+    return {
+        "term": term,
+        "meaning": meaning,
+        "page": page,
+        "source": source
+    }
+
+
+def extract_sentence_definition(text, page):
+    """
+    Recognise definitions such as:
+    A compiler is a program...
+    Digital signals are...
+    Programming is the process...
+    Compiler: a system software component...
+    """
+    text = text.strip()
+    if not text or "?" in text:
         return None
 
     patterns = [
-        # A compiler is a program...
         re.compile(
             r"^(?:a|an|the)\s+(.{2,65}?)\s+"
             r"(?:is defined as|are defined as|is referred to as|"
@@ -227,14 +306,6 @@ def extract_definition(sentence):
             r"(.+)$",
             re.I
         ),
-
-        # Compiler: a system software program...
-        re.compile(
-            r"^(.{2,65}?)\s*:\s*(?:is|are)?\s*(.{15,})$",
-            re.I
-        ),
-
-        # Compiler is a system software program...
         re.compile(
             r"^(.{2,65}?)\s+"
             r"(?:is defined as|are defined as|refers to|"
@@ -245,111 +316,166 @@ def extract_definition(sentence):
             r"requires|depends on)\s+(.+)$",
             re.I
         ),
-
-        # Handles imperfect notes such as "A variable a name..."
         re.compile(
-            r"^(?:a|an)\s+([A-Za-z][A-Za-z0-9+#.-]*(?:\s+"
-            r"[A-Za-z][A-Za-z0-9+#.-]*){0,4})\s+"
-            r"(?:a|an)\s+(.{15,})$",
+            r"^(.{2,65}?)\s*:\s*(?:is|are)?\s*(.{20,})$",
             re.I
         )
     ]
 
     for pattern in patterns:
-        match = pattern.match(line)
+        match = pattern.match(text)
 
         if not match:
             continue
 
-        term = match.group(1).strip(" ,;:-.")
-        meaning = match.group(2).strip()
-        meaning = re.sub(r"[.!?]+$", "", meaning).strip()
+        item = make_item(
+            match.group(1),
+            match.group(2),
+            page,
+            text
+        )
 
-        if not valid_term(term):
-            continue
+        if item:
+            return item
 
-        if len(meaning) < 18 or len(meaning.split()) < 4:
-            continue
+    # Recover a common imperfect note format:
+    # "A variable a name used to store..."
+    match = re.match(
+        r"^(?:a|an)\s+"
+        r"([A-Za-z][A-Za-z0-9+#.-]*(?:\s+"
+        r"[A-Za-z][A-Za-z0-9+#.-]*){0,3})\s+"
+        r"(?:a|an)\s+(.{20,})$",
+        text, re.I
+    )
 
-        if re.match(
-            r"^(what|which|who|when|where|why|how)\b",
-            meaning, re.I
-        ):
-            continue
-
-        if re.fullmatch(
-            r"[\d\s.,;:()=+\-*/]+",
-            meaning
-        ):
-            continue
-
-        return {
-            "term": term,
-            "meaning": meaning,
-            "source": sentence
-        }
+    if match:
+        return make_item(
+            match.group(1), match.group(2), page, text
+        )
 
     return None
 
 
-def find_definitions(sentences):
+def question_heading_term(text):
+    match = re.match(
+        r"^(?:what|define|explain)\s+(?:is|are|the)\s+"
+        r"(.+?)\s*\??$",
+        text.strip(), re.I
+    )
+
+    if not match:
+        return None
+
+    term = clean_term(match.group(1))
+    return term if valid_term(term) else None
+
+
+def heading_term(text):
+    text = re.sub(r"^\d+[\s.)-]+", "", text).strip()
+    text = clean_term(text)
+
+    if is_bad_heading(text) or not valid_term(text):
+        return None
+
+    # A heading should be short, not a sentence or code fragment.
+    if len(text.split()) > 6 or len(text) > 55:
+        return None
+
+    if re.search(r"[=<>{}\[\]();]", text):
+        return None
+
+    return text
+
+
+def find_definitions(blocks):
     found = []
 
-    # First, extract definitions written in normal sentence format.
-    for sentence in sentences:
-        item = extract_definition(sentence)
+    # First pass: extract complete definitions.
+    for block in blocks:
+        item = extract_sentence_definition(
+            block["text"], block["page"]
+        )
 
         if item:
             found.append(item)
 
-    # Next, handle standalone headings followed by explanations.
-    for index in range(len(sentences) - 1):
-        heading = sentences[index].strip()
-        explanation = sentences[index + 1].strip()
+    # Second pass: pair question headings and standalone headings
+    # with their explanations.
+    for index, block in enumerate(blocks):
+        heading = block["text"].strip()
+        term = question_heading_term(heading)
 
-        heading = re.sub(r"^\d+[\s.)-]+", "", heading).strip()
+        if not term:
+            term = heading_term(heading)
 
-        if not valid_term(heading):
+        if not term:
             continue
 
-        if len(heading.split()) > 6:
-            continue
+        # Search the next few blocks on the same page.
+        for following in blocks[index + 1:index + 4]:
+            if following["page"] != block["page"]:
+                break
 
-        if extract_definition(heading):
-            continue
+            explanation = following["text"].strip()
 
-        if len(explanation.split()) < 5:
-            continue
+            if not explanation or "?" in explanation:
+                continue
 
-        if len(explanation) < 20:
-            continue
+            # A new heading means the previous heading had no
+            # usable explanation.
+            if question_heading_term(explanation):
+                break
 
-        if is_unwanted_line(explanation):
-            continue
+            # Prefer explanations that refer directly to the term.
+            direct = extract_sentence_definition(
+                explanation, following["page"]
+            )
 
-        # Avoid pairing two unrelated complete definitions.
-        if extract_definition(explanation):
-            continue
+            if direct:
+                if direct["term"].casefold() == term.casefold():
+                    found.append(direct)
+                    break
 
-        if re.match(
-            r"^(example|for example|note|figure|table|source code)\b",
-            explanation, re.I
-        ):
-            continue
+                # The following block defines another concept.
+                break
 
-        found.append({
-            "term": heading,
-            "meaning": re.sub(r"[.!?]+$", "", explanation),
-            "source": heading + " " + explanation
-        })
+            # Handle "It is a..." after a "What is X?" heading.
+            pronoun = re.match(
+                r"^(it|this|they)\s+(is|are)\s+(.+)$",
+                explanation, re.I
+            )
 
-    # Remove duplicate concepts and retain the fuller explanation.
+            if pronoun:
+                explanation = pronoun.group(3)
+
+            elif re.match(
+                r"^(a|an|the)\s+" + re.escape(term) + r"\b",
+                explanation, re.I
+            ):
+                explanation = re.sub(
+                    r"^(a|an|the)\s+" + re.escape(term) + r"\s+",
+                    "", explanation, count=1, flags=re.I
+                )
+
+            elif len(explanation.split()) <= 8:
+                continue
+
+            item = make_item(
+                term,
+                explanation,
+                following["page"],
+                heading + " " + explanation
+            )
+
+            if item:
+                found.append(item)
+                break
+
+    # Remove duplicates while keeping the most complete explanation.
     unique = OrderedDict()
 
     for item in found:
-        key = re.sub(
-            r"\s+", " ", item["term"]
-        ).casefold()
+        key = item["term"].casefold()
 
         if (
             key not in unique
@@ -360,64 +486,18 @@ def find_definitions(sentences):
     return list(unique.values())
 
 
-def get_category(item):
-    text = (item["term"] + " " + item["meaning"]).lower()
-
-    groups = {
-        "programming_languages": [
-            "python", "java", "javascript", "c++",
-            "c language", "sql", "pascal", "prolog", "haskell"
-        ],
-        "programming_methods": [
-            "procedural", "object-oriented",
-            "functional programming", "logic programming",
-            "declarative", "concurrent", "parallel"
-        ],
-        "software_tools": [
-            "compiler", "interpreter", "linker",
-            "loader", "assembler", "debugger"
-        ],
-        "program_errors": [
-            "syntax error", "semantic error", "type error",
-            "linking error", "runtime error", "logical error"
-        ],
-        "logic_gates": [
-            "and gate", "or gate", "not gate", "nand gate",
-            "nor gate", "xor gate", "xnor gate"
-        ],
-        "data_concepts": [
-            "variable", "constant", "data type", "array",
-            "string", "integer", "float", "boolean", "operator",
-            "list", "tuple", "dictionary", "set"
-        ],
-        "control_structures": [
-            "if statement", "if-else", "loop",
-            "for loop", "while loop", "switch",
-            "iteration", "selection"
-        ]
-    }
-
-    for category, terms in groups.items():
-        if any(term in text for term in terms):
-            return category
-
-    return "other"
-
-
 def word_similarity(first, second):
-    a = set(
-        re.findall(
-            r"[a-z]{3,}",
-            (first["term"] + " " + first["meaning"]).lower()
+    def words(item):
+        result = set(
+            re.findall(
+                r"[a-z][a-z0-9+#-]{2,}",
+                (item["term"] + " " + item["meaning"]).lower()
+            )
         )
-    ) - STOP_WORDS
+        return result - STOP_WORDS
 
-    b = set(
-        re.findall(
-            r"[a-z]{3,}",
-            (second["term"] + " " + second["meaning"]).lower()
-        )
-    ) - STOP_WORDS
+    a = words(first)
+    b = words(second)
 
     if not a or not b:
         return 0
@@ -427,7 +507,6 @@ def word_similarity(first, second):
 
 def get_distractors(item, definitions):
     candidates = []
-    category = get_category(item)
 
     for other in definitions:
         if other["term"].casefold() == item["term"].casefold():
@@ -436,56 +515,72 @@ def get_distractors(item, definitions):
         if not valid_term(other["term"]):
             continue
 
-        other_category = get_category(other)
         similarity = word_similarity(item, other)
 
-        # Prefer concepts from the same technical category.
-        score = similarity
-
-        if category != "other" and other_category == category:
-            score += 2
-
-        # Give a small preference to concepts with similar wording.
-        if similarity > 0:
-            score += similarity
+        # Prefer concepts on the same page, then related concepts
+        # elsewhere in the uploaded document.
+        same_page = other["page"] == item["page"]
+        score = similarity + (0.15 if same_page else 0)
 
         candidates.append((other["term"], score))
 
     candidates.sort(key=lambda x: x[1], reverse=True)
 
-    distractors = []
+    result = []
     seen = {item["term"].casefold()}
 
     for term, score in candidates:
         key = term.casefold()
 
-        if key not in seen:
-            distractors.append(term)
-            seen.add(key)
+        if key in seen:
+            continue
 
-        if len(distractors) == 3:
+        result.append(term)
+        seen.add(key)
+
+        if len(result) == 3:
             break
 
-    return distractors
+    return result
+
+
+def valid_options(answer, distractors):
+    if not isinstance(answer, str) or not answer.strip():
+        return False
+
+    if len(distractors) != 3:
+        return False
+
+    options = [answer] + distractors
+
+    if any(
+        not isinstance(option, str) or not option.strip()
+        for option in options
+    ):
+        return False
+
+    if any(not valid_term(option) for option in options):
+        return False
+
+    normalised = [option.strip().casefold() for option in options]
+    return len(set(normalised)) == 4
 
 
 def make_question(item, definitions):
     distractors = get_distractors(item, definitions)
 
-    if len(distractors) != 3:
+    if not valid_options(item["term"], distractors):
         return None
-
-    question = (
-        "Which term matches this definition? "
-        + item["meaning"].rstrip(".!?; ")
-        + "?"
-    )
 
     options = [item["term"]] + distractors
     random.shuffle(options)
 
     return {
-        "question": question,
+        "question": (
+            "Which term matches this definition? "
+            + item["meaning"].rstrip(".!? ")
+            + "?"
+        ),
         "answer": item["term"],
         "options": options,
         "selected": None,
@@ -501,25 +596,21 @@ def make_mcqs(definitions, limit=30):
     random.shuffle(concepts)
 
     for item in concepts:
+        if len(questions) >= limit:
+            break
+
+        key = item["term"].casefold()
+
+        if key in used:
+            continue
+
         question = make_question(item, definitions)
 
         if not question:
             continue
 
-        key = question["question"].casefold()
-
-        if key in used:
-            continue
-
-        # Confirm all four choices are different.
-        if len(set(x.casefold() for x in question["options"])) != 4:
-            continue
-
         questions.append(question)
         used.add(key)
-
-        if len(questions) >= limit:
-            break
 
     return questions
 
@@ -567,16 +658,16 @@ def generate(kind):
         if len(study_text) < 40:
             raise ValueError(
                 "Very little text could be extracted. "
-                "Scanned/image-only PDFs need OCR before uploading."
+                "Scanned or image-only PDFs need OCR."
             )
 
-        sentences = get_sentences(study_text)
-        definitions = find_definitions(sentences)
+        blocks = get_blocks(study_text)
+        definitions = find_definitions(blocks)
 
         if not definitions:
             raise ValueError(
-                "No clear concepts or explanations were found. "
-                "Please try a text-based PDF or TXT file."
+                "No reliable concepts and explanations were found. "
+                "Try a text-based PDF or TXT file with explanatory content."
             )
 
         if kind == "mcq":
@@ -585,7 +676,8 @@ def generate(kind):
             if not questions:
                 raise ValueError(
                     "The document did not contain enough distinct "
-                    "concepts to create reliable four-option MCQs."
+                    "concepts to create reliable four-option MCQs. "
+                    "Try a more detailed document."
                 )
 
             saved_results = {
@@ -594,8 +686,8 @@ def generate(kind):
             }
 
             message = (
-                f"Generated {len(questions)} definition-based MCQs "
-                f"from {len(definitions)} extracted concepts."
+                f"Generated {len(questions)} MCQs from "
+                f"{len(definitions)} extracted concepts."
             )
 
         else:
@@ -664,7 +756,10 @@ def answer():
             questions[index]["selected"] = chosen
             questions[index]["checked"] = True
 
-            RESULTS_STORE[session.get("data_id")]["results"] = data
+            data_id = session.get("data_id")
+
+            if data_id in RESULTS_STORE:
+                RESULTS_STORE[data_id]["results"] = data
 
     return redirect(url_for("home"))
 
@@ -679,7 +774,10 @@ def reveal(index):
             "shown", False
         )
 
-        RESULTS_STORE[session.get("data_id")]["results"] = data
+        data_id = session.get("data_id")
+
+        if data_id in RESULTS_STORE:
+            RESULTS_STORE[data_id]["results"] = data
 
     return redirect(url_for("home"))
 
@@ -746,10 +844,9 @@ def download_pdf():
 
             parts.extend([
                 Paragraph(
-                    f"<font color='#287653'><b>"
-                    f"Correct answer: "
-                    f"{escape(str(question['answer']))}"
-                    f"</b></font>",
+                    "<font color='#287653'><b>"
+                    f"Correct answer: {escape(str(question['answer']))}"
+                    "</b></font>",
                     body
                 ),
                 Spacer(1, 12)
@@ -764,8 +861,7 @@ def download_pdf():
             story.append(
                 KeepTogether([
                     Paragraph(
-                        f"<b>{number}. "
-                        f"{escape(str(card['front']))}</b>",
+                        f"<b>{number}. {escape(str(card['front']))}</b>",
                         body
                     ),
                     Paragraph(
