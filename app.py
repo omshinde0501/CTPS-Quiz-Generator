@@ -1,14 +1,17 @@
 
 import io
+import json
+import logging
+import os
 import random
 import re
 import uuid
-from collections import OrderedDict
+import urllib.error
+import urllib.request
+from html import escape
 
 import fitz
 from flask import Flask, render_template, request, redirect, url_for, session, send_file
-from html import escape
-
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
@@ -17,617 +20,735 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, KeepTogethe
 from reportlab.lib.units import mm
 
 
+# -----------------------------------------------------------------------------
+# APP CONFIGURATION
+# -----------------------------------------------------------------------------
+
 app = Flask(__name__)
-app.secret_key = "ctps-quiz-generator-change-this-key"
+app.secret_key = os.environ.get(
+    "SECRET_KEY",
+    "ctps-quiz-generator-local-secret-change-me"
+)
+app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
+app.logger.setLevel(logging.INFO)
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.environ.get(
+    "GROQ_MODEL",
+    "openai/gpt-oss-20b"
+).strip()
+
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+CHUNK_SIZE = 4500
+MAX_CHUNKS = 6
+QUESTIONS_PER_CHUNK = 5
+CARDS_PER_CHUNK = 6
+
 RESULTS_STORE = {}
 
-STOP_WORDS = {
-    "the", "and", "for", "that", "this", "with", "from", "into",
-    "are", "which", "used", "use", "its", "their", "they", "them",
-    "can", "may", "will", "would", "should", "could", "also",
-    "such", "when", "where", "while", "through", "using", "often",
-    "than", "then", "have", "has", "been", "being", "was", "were",
-    "each", "more", "most", "some", "many", "other", "another",
-    "very", "about", "because", "these", "those", "both", "only",
-    "one", "two", "first", "second", "following", "example",
-    "which", "what", "how", "why", "who"
-}
 
-BAD_HEADINGS = {
-    "contents", "table of contents", "references", "bibliography",
-    "index", "acknowledgements", "learning objectives",
-    "introduction", "conclusion", "overview", "summary",
-    "programming fundamentals", "digital electronics",
-    "computational thinking", "problem solving",
-    "advantages", "disadvantages", "applications",
-    "examples", "definition", "definitions", "unit",
-    "chapter", "module", "semester", "subject",
-    "working", "description", "notes", "types", "steps",
-    "classification", "history", "syllabus"
-}
-
+# -----------------------------------------------------------------------------
+# SESSION STORAGE
+# -----------------------------------------------------------------------------
 
 def get_saved_results():
     return RESULTS_STORE.get(session.get("data_id"), {})
 
 
-def read_file(file):
-    name = (file.filename or "").lower()
-    data = file.read()
+def save_results(results, mode):
+    data_id = str(uuid.uuid4())
 
-    if name.endswith(".txt"):
-        return data.decode("utf-8-sig", errors="ignore")
+    RESULTS_STORE[data_id] = {
+        "results": results,
+        "mode": mode
+    }
 
-    if name.endswith(".pdf"):
+    session["data_id"] = data_id
+
+
+# -----------------------------------------------------------------------------
+# FILE READING
+# -----------------------------------------------------------------------------
+
+def read_file(uploaded_file):
+
+    filename = (uploaded_file.filename or "").lower()
+    raw_data = uploaded_file.read()
+
+    if filename.endswith(".txt"):
+        return raw_data.decode("utf-8", errors="replace")
+
+    if filename.endswith(".pdf"):
+
         try:
-            with fitz.open(stream=data, filetype="pdf") as document:
+            with fitz.open(
+                stream=raw_data,
+                filetype="pdf"
+            ) as document:
+
                 if document.is_encrypted and not document.authenticate(""):
                     raise ValueError(
-                        "This PDF is password-protected. Upload an unlocked PDF."
+                        "This PDF is password-protected. "
+                        "Please upload an unlocked PDF."
                     )
 
-                # Form-feed preserves page boundaries for extraction.
-                return "\n\f\n".join(
-                    page.get_text("text", sort=True)
-                    for page in document
-                )
+                page_text = []
+
+                for page_number, page in enumerate(document, start=1):
+
+                    page_content = page.get_text(
+                        "text",
+                        sort=True
+                    ).strip()
+
+                    if page_content:
+                        page_text.append(
+                            f"\n\n[Page {page_number}]\n{page_content}"
+                        )
+
+                if not page_text:
+                    raise ValueError(
+                        "No selectable text was found. "
+                        "This may be a scanned PDF; OCR is needed first."
+                    )
+
+                return "\n".join(page_text)
+
         except fitz.FileDataError:
-            raise ValueError("The PDF could not be opened. Try another file.")
+            raise ValueError(
+                "The PDF could not be opened. Please try a valid PDF file."
+            )
 
-    raise ValueError("Please choose a PDF or TXT file.")
+    raise ValueError("Please upload a PDF or TXT file.")
 
 
-def is_bad_heading(text):
-    text = re.sub(r"\s+", " ", text).strip()
-    lower = text.casefold().rstrip(" .:")
-
-    if not text or len(text) < 3:
-        return True
-
-    if lower in BAD_HEADINGS:
-        return True
-
-    if re.match(
-        r"^(unit|chapter|module|semester|subject)\s*[-:#\d]",
-        text, re.I
-    ):
-        return True
-
-    if re.match(r"^(page\s*)?\d+(\s*of\s*\d+)?$", text, re.I):
-        return True
-
-    if re.fullmatch(r"[\d\s./-]+", text):
-        return True
-
-    if re.match(
-        r"^(read|refer to|study|follow|go through)\b",
-        text, re.I
-    ):
-        return True
-
-    return False
-
+# -----------------------------------------------------------------------------
+# TEXT CLEANING
+# -----------------------------------------------------------------------------
 
 def clean_study_text(text):
-    cleaned = []
 
-    for line in text.replace("\x00", " ").splitlines():
-        line = re.sub(r"\s+", " ", line).strip()
+    cleaned_lines = []
+
+    for raw_line in text.replace("\x00", " ").replace("\uf0b7", "•").splitlines():
+
+        line = re.sub(r"[ \t]+", " ", raw_line).strip()
 
         if not line:
-            cleaned.append("")
+            cleaned_lines.append("")
+            continue
+
+        if re.fullmatch(
+            r"(?:page\s*)?\d+(?:\s*of\s*\d+)?",
+            line,
+            re.I
+        ):
+            continue
+
+        if re.fullmatch(r"[-_=•·\s]{3,}", line):
             continue
 
         if re.match(
-            r"^(unit|chapter|module|semester)\s*[-:#\d]",
-            line, re.I
+            r"^(table of contents|bibliography|references|acknowledgements?)\s*$",
+            line,
+            re.I
         ):
             continue
 
-        if re.match(r"^(page\s*)?\d+(\s*of\s*\d+)?$", line, re.I):
-            continue
+        cleaned_lines.append(line)
 
-        if line.casefold().rstrip(" .:") in BAD_HEADINGS:
-            continue
+    text = "\n".join(cleaned_lines)
 
-        cleaned.append(line)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
 
-    return "\n".join(cleaned)
-
-
-def get_blocks(text):
-    """
-    Reconstruct paragraphs from PDF lines while preserving headings,
-    question prompts and page boundaries.
-    """
-    blocks = []
-
-    for page_number, page in enumerate(text.split("\f")):
-        current = []
-
-        def flush():
-            if current:
-                value = " ".join(current).strip()
-                if len(value) >= 8:
-                    blocks.append({
-                        "text": value,
-                        "page": page_number
-                    })
-                current.clear()
-
-        for raw_line in page.splitlines():
-            line = re.sub(r"\s+", " ", raw_line).strip()
-
-            if not line:
-                flush()
-                continue
-
-            # A question-style heading is useful for identifying
-            # the concept explained immediately after it.
-            if re.match(
-                r"^(what|define|explain)\s+(is|are|the)\b",
-                line, re.I
-            ) and len(line) < 120:
-                flush()
-                blocks.append({
-                    "text": line,
-                    "page": page_number
-                })
-                continue
-
-            # Short unpunctuated lines are likely slide headings.
-            heading = (
-                len(line) <= 65
-                and len(line.split()) <= 8
-                and not re.search(r"[.!?]", line)
-                and not re.match(
-                    r"^(a|an|the)\s+\w+\s+(is|are|means)\b",
-                    line, re.I
-                )
-            )
-
-            if heading:
-                flush()
-                blocks.append({
-                    "text": line,
-                    "page": page_number
-                })
-                continue
-
-            # Avoid joining a new sentence to a completed one.
-            if current and re.search(r"[.!?]$", current[-1]):
-                flush()
-
-            current.append(line)
-
-        flush()
-
-    return blocks
+    return text.strip()
 
 
-def clean_term(term):
-    term = re.sub(r"^\d+[\s.)-]+", "", term).strip()
-    term = re.sub(r"^(a|an|the)\s+", "", term, flags=re.I)
-    return re.sub(r"\s+", " ", term).strip(" ,;:-.")
+# -----------------------------------------------------------------------------
+# TEXT CHUNKING
+# -----------------------------------------------------------------------------
 
+def split_into_chunks(
+    text,
+    chunk_size=CHUNK_SIZE,
+    max_chunks=MAX_CHUNKS
+):
 
-def valid_term(term):
-    term = clean_term(term)
-    words = re.findall(r"[A-Za-z][A-Za-z0-9+#.-]*", term)
-
-    if not words or len(words) > 7 or len(term) > 65:
-        return False
-
-    if term.casefold() in BAD_HEADINGS:
-        return False
-
-    if words[0].casefold() in STOP_WORDS:
-        return False
-
-    if re.search(
-        r"\b(is|are|was|were|what|which|who|how|why|when|where)\b",
-        term, re.I
-    ):
-        return False
-
-    if re.search(r"[?=]", term):
-        return False
-
-    if re.match(
-        r"^(the following|in this|according to|for example)\b",
-        term, re.I
-    ):
-        return False
-
-    if len(words) == 1 and len(words[0]) < 3:
-        return False
-
-    return True
-
-
-def make_item(term, meaning, page, source):
-    term = clean_term(term)
-    meaning = re.sub(r"\s+", " ", meaning).strip()
-    meaning = re.sub(r"^[,;:\-\s]+", "", meaning)
-    meaning = re.sub(r"[.!?]+$", "", meaning).strip()
-
-    if not valid_term(term):
-        return None
-
-    if len(meaning) < 20 or len(meaning.split()) < 5:
-        return None
-
-    if "?" in meaning:
-        return None
-
-    if re.match(
-        r"^(what|which|who|when|where|why|how)\b",
-        meaning, re.I
-    ):
-        return None
-
-    if re.match(
-        r"^(example|for example|note|figure|table|"
-        r"source code|references)\b",
-        meaning, re.I
-    ):
-        return None
-
-    return {
-        "term": term,
-        "meaning": meaning,
-        "page": page,
-        "source": source
-    }
-
-
-def extract_sentence_definition(text, page):
-    """
-    Recognise definitions such as:
-    A compiler is a program...
-    Digital signals are...
-    Programming is the process...
-    Compiler: a system software component...
-    """
-    text = text.strip()
-    if not text or "?" in text:
-        return None
-
-    patterns = [
-        re.compile(
-            r"^(?:a|an|the)\s+(.{2,65}?)\s+"
-            r"(?:is defined as|are defined as|is referred to as|"
-            r"refers to|is known as|are known as|is called|"
-            r"are called|is a type of|are a type of|"
-            r"is the process of|is|are|means|denotes|represents|"
-            r"consists of|contains|includes|comprises|"
-            r"allows|enables|performs|converts|stores|produces|"
-            r"generates|controls|connects|requires|depends on)\s+"
-            r"(.+)$",
-            re.I
-        ),
-        re.compile(
-            r"^(.{2,65}?)\s+"
-            r"(?:is defined as|are defined as|refers to|"
-            r"is known as|is called|means|denotes|represents|"
-            r"consists of|contains|includes|comprises|"
-            r"supports|allows|enables|performs|converts|"
-            r"stores|produces|generates|controls|connects|"
-            r"requires|depends on)\s+(.+)$",
-            re.I
-        ),
-        re.compile(
-            r"^(.{2,65}?)\s*:\s*(?:is|are)?\s*(.{20,})$",
-            re.I
-        )
+    paragraphs = [
+        p.strip()
+        for p in re.split(r"\n\s*\n", text)
+        if p.strip()
     ]
 
-    for pattern in patterns:
-        match = pattern.match(text)
+    chunks = []
+    current = ""
 
-        if not match:
-            continue
+    def add_piece(piece):
 
-        item = make_item(
-            match.group(1),
-            match.group(2),
-            page,
-            text
-        )
+        nonlocal current
 
-        if item:
-            return item
+        piece = piece.strip()
 
-    # Recover a common imperfect note format:
-    # "A variable a name used to store..."
-    match = re.match(
-        r"^(?:a|an)\s+"
-        r"([A-Za-z][A-Za-z0-9+#.-]*(?:\s+"
-        r"[A-Za-z][A-Za-z0-9+#.-]*){0,3})\s+"
-        r"(?:a|an)\s+(.{20,})$",
-        text, re.I
+        if not piece:
+            return
+
+        if len(piece) > chunk_size:
+
+            sentences = re.split(
+                r"(?<=[.!?])\s+",
+                piece
+            )
+
+            for sentence in sentences:
+
+                if len(sentence) > chunk_size:
+
+                    for start in range(
+                        0,
+                        len(sentence),
+                        chunk_size
+                    ):
+                        add_piece(
+                            sentence[start:start + chunk_size]
+                        )
+
+                elif not current:
+                    current = sentence
+
+                elif len(current) + len(sentence) + 1 <= chunk_size:
+                    current += " " + sentence
+
+                else:
+                    chunks.append(current)
+                    current = sentence
+
+            return
+
+        if not current:
+            current = piece
+
+        elif len(current) + len(piece) + 2 <= chunk_size:
+            current += "\n\n" + piece
+
+        else:
+            chunks.append(current)
+            current = piece
+
+    for paragraph in paragraphs:
+        add_piece(paragraph)
+
+    if current:
+        chunks.append(current)
+
+    if not chunks:
+        return []
+
+    if len(chunks) <= max_chunks:
+        return chunks
+
+    # Sample across the beginning, middle and end of long documents.
+    indexes = [
+        round(i * (len(chunks) - 1) / (max_chunks - 1))
+        for i in range(max_chunks)
+    ]
+
+    return [chunks[i] for i in indexes]
+
+
+def normalize_for_match(text):
+
+    text = str(text or "").lower()
+
+    text = re.sub(
+        r"[^a-z0-9+#]+",
+        " ",
+        text
     )
 
-    if match:
-        return make_item(
-            match.group(1), match.group(2), page, text
-        )
-
-    return None
-
-
-def question_heading_term(text):
-    match = re.match(
-        r"^(?:what|define|explain)\s+(?:is|are|the)\s+"
-        r"(.+?)\s*\??$",
-        text.strip(), re.I
-    )
-
-    if not match:
-        return None
-
-    term = clean_term(match.group(1))
-    return term if valid_term(term) else None
-
-
-def heading_term(text):
-    text = re.sub(r"^\d+[\s.)-]+", "", text).strip()
-    text = clean_term(text)
-
-    if is_bad_heading(text) or not valid_term(text):
-        return None
-
-    # A heading should be short, not a sentence or code fragment.
-    if len(text.split()) > 6 or len(text) > 55:
-        return None
-
-    if re.search(r"[=<>{}\[\]();]", text):
-        return None
-
-    return text
-
-
-def find_definitions(blocks):
-    found = []
-
-    # First pass: extract complete definitions.
-    for block in blocks:
-        item = extract_sentence_definition(
-            block["text"], block["page"]
-        )
-
-        if item:
-            found.append(item)
-
-    # Second pass: pair question headings and standalone headings
-    # with their explanations.
-    for index, block in enumerate(blocks):
-        heading = block["text"].strip()
-        term = question_heading_term(heading)
-
-        if not term:
-            term = heading_term(heading)
-
-        if not term:
-            continue
-
-        # Search the next few blocks on the same page.
-        for following in blocks[index + 1:index + 4]:
-            if following["page"] != block["page"]:
-                break
-
-            explanation = following["text"].strip()
-
-            if not explanation or "?" in explanation:
-                continue
-
-            # A new heading means the previous heading had no
-            # usable explanation.
-            if question_heading_term(explanation):
-                break
-
-            # Prefer explanations that refer directly to the term.
-            direct = extract_sentence_definition(
-                explanation, following["page"]
-            )
-
-            if direct:
-                if direct["term"].casefold() == term.casefold():
-                    found.append(direct)
-                    break
-
-                # The following block defines another concept.
-                break
-
-            # Handle "It is a..." after a "What is X?" heading.
-            pronoun = re.match(
-                r"^(it|this|they)\s+(is|are)\s+(.+)$",
-                explanation, re.I
-            )
-
-            if pronoun:
-                explanation = pronoun.group(3)
-
-            elif re.match(
-                r"^(a|an|the)\s+" + re.escape(term) + r"\b",
-                explanation, re.I
-            ):
-                explanation = re.sub(
-                    r"^(a|an|the)\s+" + re.escape(term) + r"\s+",
-                    "", explanation, count=1, flags=re.I
-                )
-
-            elif len(explanation.split()) <= 8:
-                continue
-
-            item = make_item(
-                term,
-                explanation,
-                following["page"],
-                heading + " " + explanation
-            )
-
-            if item:
-                found.append(item)
-                break
-
-    # Remove duplicates while keeping the most complete explanation.
-    unique = OrderedDict()
-
-    for item in found:
-        key = item["term"].casefold()
-
-        if (
-            key not in unique
-            or len(item["meaning"]) > len(unique[key]["meaning"])
-        ):
-            unique[key] = item
-
-    return list(unique.values())
-
-
-def word_similarity(first, second):
-    def words(item):
-        result = set(
-            re.findall(
-                r"[a-z][a-z0-9+#-]{2,}",
-                (item["term"] + " " + item["meaning"]).lower()
-            )
-        )
-        return result - STOP_WORDS
-
-    a = words(first)
-    b = words(second)
-
-    if not a or not b:
-        return 0
-
-    return len(a & b) / len(a | b)
-
-
-def get_distractors(item, definitions):
-    candidates = []
-
-    for other in definitions:
-        if other["term"].casefold() == item["term"].casefold():
-            continue
-
-        if not valid_term(other["term"]):
-            continue
-
-        similarity = word_similarity(item, other)
-
-        # Prefer concepts on the same page, then related concepts
-        # elsewhere in the uploaded document.
-        same_page = other["page"] == item["page"]
-        score = similarity + (0.15 if same_page else 0)
-
-        candidates.append((other["term"], score))
-
-    candidates.sort(key=lambda x: x[1], reverse=True)
-
-    result = []
-    seen = {item["term"].casefold()}
-
-    for term, score in candidates:
-        key = term.casefold()
-
-        if key in seen:
-            continue
-
-        result.append(term)
-        seen.add(key)
-
-        if len(result) == 3:
-            break
-
-    return result
-
-
-def valid_options(answer, distractors):
-    if not isinstance(answer, str) or not answer.strip():
-        return False
-
-    if len(distractors) != 3:
-        return False
-
-    options = [answer] + distractors
-
-    if any(
-        not isinstance(option, str) or not option.strip()
-        for option in options
-    ):
-        return False
-
-    if any(not valid_term(option) for option in options):
-        return False
-
-    normalised = [option.strip().casefold() for option in options]
-    return len(set(normalised)) == 4
-
-
-def make_question(item, definitions):
-    distractors = get_distractors(item, definitions)
-
-    if not valid_options(item["term"], distractors):
-        return None
-
-    options = [item["term"]] + distractors
-    random.shuffle(options)
-
-    return {
-        "question": (
-            "Which term matches this definition? "
-            + item["meaning"].rstrip(".!? ")
-            + "?"
-        ),
-        "answer": item["term"],
-        "options": options,
-        "selected": None,
-        "checked": False
-    }
-
-
-def make_mcqs(definitions, limit=30):
-    questions = []
-    used = set()
-
-    concepts = definitions[:]
-    random.shuffle(concepts)
-
-    for item in concepts:
-        if len(questions) >= limit:
-            break
-
-        key = item["term"].casefold()
-
-        if key in used:
-            continue
-
-        question = make_question(item, definitions)
-
-        if not question:
-            continue
-
-        questions.append(question)
-        used.add(key)
-
-    return questions
-
-
-def make_flashcards(definitions):
-    return [
-        {
-            "front": item["term"],
-            "back": item["meaning"],
-            "shown": False
+    return re.sub(r"\s+", " ", text).strip()
+
+
+# -----------------------------------------------------------------------------
+# GROQ JSON SCHEMAS
+# -----------------------------------------------------------------------------
+
+MCQ_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    "answer": {"type": "string"},
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "evidence": {"type": "string"}
+                },
+                "required": [
+                    "question",
+                    "answer",
+                    "options",
+                    "evidence"
+                ],
+                "additionalProperties": False
+            }
         }
-        for item in definitions[:50]
-    ]
+    },
+    "required": ["questions"],
+    "additionalProperties": False
+}
 
+
+FLASHCARD_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "cards": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "front": {"type": "string"},
+                    "back": {"type": "string"},
+                    "evidence": {"type": "string"}
+                },
+                "required": [
+                    "front",
+                    "back",
+                    "evidence"
+                ],
+                "additionalProperties": False
+            }
+        }
+    },
+    "required": ["cards"],
+    "additionalProperties": False
+}
+
+
+# -----------------------------------------------------------------------------
+# GROQ API CONNECTION
+# -----------------------------------------------------------------------------
+
+def call_groq(
+    system_prompt,
+    user_prompt,
+    schema,
+    schema_name
+):
+
+    if not GROQ_API_KEY:
+        raise ValueError(
+            "The Groq API key is missing. "
+            "Add GROQ_API_KEY in Render Environment Variables and redeploy."
+        )
+
+    payload = {
+        "model": GROQ_MODEL,
+
+        "messages": [
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": user_prompt
+            }
+        ],
+
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema_name,
+                "strict": True,
+                "schema": schema
+            }
+        },
+
+        "temperature": 0.2,
+        "max_completion_tokens": 3500
+    }
+
+    request_data = json.dumps(payload).encode("utf-8")
+
+    api_request = urllib.request.Request(
+        GROQ_API_URL,
+        data=request_data,
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        method="POST"
+    )
+
+    try:
+
+        with urllib.request.urlopen(
+            api_request,
+            timeout=120
+        ) as response:
+
+            response_body = response.read().decode("utf-8")
+
+        response_json = json.loads(response_body)
+
+        content = response_json["choices"][0]["message"].get("content")
+
+        if not content:
+            raise ValueError(
+                "Groq returned an empty response. Please try again."
+            )
+
+        return json.loads(content)
+
+    except urllib.error.HTTPError as error:
+
+        details = error.read().decode(
+            "utf-8",
+            errors="replace"
+        )
+
+        app.logger.error(
+            "Groq API HTTP %s: %s",
+            error.code,
+            details[:1500]
+        )
+
+        if error.code == 401:
+            raise ValueError(
+                "Groq rejected the API key. Check GROQ_API_KEY in Render."
+            )
+
+        if error.code == 429:
+            raise ValueError(
+                "Groq's free-tier rate limit was reached. "
+                "Please wait a little and try again."
+            )
+
+        if error.code == 400:
+            raise ValueError(
+                "Groq rejected the request or model setting. "
+                "Check the GROQ_MODEL value in Render."
+            )
+
+        raise ValueError(
+            f"Groq API error ({error.code}). Please try again later."
+        )
+
+    except urllib.error.URLError as error:
+
+        app.logger.error(
+            "Groq connection error: %s",
+            error
+        )
+
+        raise ValueError(
+            "Could not connect to Groq. Please try again in a moment."
+        )
+
+    except (
+        KeyError,
+        IndexError,
+        json.JSONDecodeError,
+        TypeError
+    ):
+
+        app.logger.exception("Unexpected Groq response")
+
+        raise ValueError(
+            "Groq returned an unreadable response. Please try again."
+        )
+
+
+# -----------------------------------------------------------------------------
+# AI PROMPTS
+# -----------------------------------------------------------------------------
+
+MCQ_SYSTEM_PROMPT = """You are an expert university-level question setter.
+
+Create accurate, useful multiple-choice questions using ONLY the supplied study text.
+
+Rules:
+
+- Test meaningful concepts, principles, applications, comparisons, causes,
+  effects, steps, properties, and definitions.
+- Do not make every question a simple definition.
+- Every correct answer must be directly supported by the supplied text.
+- Each question must have exactly four distinct, plausible options.
+- All four options must be real terms, concepts, values, or processes
+  that appear in the supplied text.
+- Do not invent distractors or use silly/generic options.
+- Exactly one option must be correct.
+- Avoid ambiguous questions and trick wording.
+- Do not ask about page numbers, slide numbers, document layout,
+  or missing information.
+- Do not repeat the same question in different wording.
+- The evidence field MUST be copied verbatim from the supplied text.
+- Evidence should be a continuous excerpt of roughly 8-35 words
+  and must support the correct answer.
+- If the text does not contain enough material for a good question,
+  return fewer questions.
+- Never use outside knowledge to fill gaps.
+"""
+
+
+FLASHCARD_SYSTEM_PROMPT = """You are an expert study-material creator.
+
+Create concise, useful flashcards using ONLY the supplied study text.
+
+Rules:
+
+- Front should be a meaningful concept, question, formula name,
+  process, or term.
+- Back should explain it accurately and clearly in 1-3 sentences.
+- Prefer important examinable concepts.
+- Avoid trivial words and headings.
+- Do not invent facts or add outside knowledge.
+- Do not create duplicate cards.
+- The evidence field MUST be copied verbatim from the supplied text.
+- Evidence should be a continuous excerpt of roughly 8-35 words
+  and must support the back of the card.
+- If the text has little useful content, return fewer cards.
+"""
+
+
+# -----------------------------------------------------------------------------
+# EVIDENCE VALIDATION
+# -----------------------------------------------------------------------------
+
+def valid_evidence(evidence, source):
+
+    evidence_norm = normalize_for_match(evidence)
+    source_norm = normalize_for_match(source)
+
+    if len(evidence_norm.split()) < 7:
+        return False
+
+    return evidence_norm in source_norm
+
+
+# -----------------------------------------------------------------------------
+# AI MCQ GENERATION
+# -----------------------------------------------------------------------------
+
+def generate_mcqs(chunks):
+
+    collected = []
+    seen_questions = set()
+    errors = []
+
+    for chunk_number, chunk in enumerate(chunks, start=1):
+
+        prompt = (
+            f"Create up to {QUESTIONS_PER_CHUNK} high-quality MCQs "
+            "from this section. Return fewer if the section does not "
+            "support enough distinct questions.\n\n"
+            f"STUDY TEXT (section {chunk_number}):\n{chunk}"
+        )
+
+        try:
+
+            result = call_groq(
+                MCQ_SYSTEM_PROMPT,
+                prompt,
+                MCQ_SCHEMA,
+                "quiz_questions"
+            )
+
+        except ValueError as error:
+
+            if not collected:
+                raise
+
+            errors.append(str(error))
+            break
+
+        for item in result.get("questions", []):
+
+            question = re.sub(
+                r"\s+",
+                " ",
+                str(item.get("question", ""))
+            ).strip()
+
+            answer = re.sub(
+                r"\s+",
+                " ",
+                str(item.get("answer", ""))
+            ).strip()
+
+            evidence = str(
+                item.get("evidence", "")
+            ).strip()
+
+            options = [
+                re.sub(
+                    r"\s+",
+                    " ",
+                    str(option)
+                ).strip()
+                for option in item.get("options", [])
+            ]
+
+            if not (
+                25 <= len(question) <= 450
+                and 1 <= len(answer) <= 100
+            ):
+                continue
+
+            if len(options) != 4:
+                continue
+
+            if any(
+                not option or len(option) > 100
+                for option in options
+            ):
+                continue
+
+            if len({
+                normalize_for_match(option)
+                for option in options
+            }) != 4:
+                continue
+
+            if answer.casefold() not in {
+                option.casefold()
+                for option in options
+            }:
+                continue
+
+            if not valid_evidence(evidence, chunk):
+                continue
+
+            source_norm = normalize_for_match(chunk)
+
+            # Reject options that are not grounded in the uploaded text.
+            if any(
+                normalize_for_match(option) not in source_norm
+                for option in options
+            ):
+                continue
+
+            if (
+                normalize_for_match(answer)
+                not in normalize_for_match(evidence)
+            ):
+                continue
+
+            question_key = normalize_for_match(question)
+
+            if question_key in seen_questions:
+                continue
+
+            seen_questions.add(question_key)
+
+            shuffled_options = options[:]
+            random.shuffle(shuffled_options)
+
+            collected.append({
+                "question": question,
+                "answer": answer,
+                "options": shuffled_options,
+                "selected": None,
+                "checked": False
+            })
+
+    return collected, errors
+
+
+# -----------------------------------------------------------------------------
+# AI FLASHCARD GENERATION
+# -----------------------------------------------------------------------------
+
+def generate_flashcards(chunks):
+
+    collected = []
+    seen_fronts = set()
+    errors = []
+
+    for chunk_number, chunk in enumerate(chunks, start=1):
+
+        prompt = (
+            f"Create up to {CARDS_PER_CHUNK} useful flashcards "
+            "from this section. Return fewer if there are not "
+            "enough important concepts.\n\n"
+            f"STUDY TEXT (section {chunk_number}):\n{chunk}"
+        )
+
+        try:
+
+            result = call_groq(
+                FLASHCARD_SYSTEM_PROMPT,
+                prompt,
+                FLASHCARD_SCHEMA,
+                "study_flashcards"
+            )
+
+        except ValueError as error:
+
+            if not collected:
+                raise
+
+            errors.append(str(error))
+            break
+
+        for item in result.get("cards", []):
+
+            front = re.sub(
+                r"\s+",
+                " ",
+                str(item.get("front", ""))
+            ).strip()
+
+            back = re.sub(
+                r"\s+",
+                " ",
+                str(item.get("back", ""))
+            ).strip()
+
+            evidence = str(
+                item.get("evidence", "")
+            ).strip()
+
+            key = normalize_for_match(front)
+
+            if not (
+                2 <= len(front) <= 100
+                and 15 <= len(back) <= 600
+            ):
+                continue
+
+            if (
+                not key
+                or key in seen_fronts
+                or not valid_evidence(evidence, chunk)
+            ):
+                continue
+
+            seen_fronts.add(key)
+
+            collected.append({
+                "front": front,
+                "back": back,
+                "shown": False
+            })
+
+    return collected, errors
+
+
+# -----------------------------------------------------------------------------
+# HOME PAGE
+# -----------------------------------------------------------------------------
 
 @app.route("/", methods=["GET"])
 def home():
+
     saved = get_saved_results()
 
     return render_template(
@@ -638,14 +759,20 @@ def home():
     )
 
 
+# -----------------------------------------------------------------------------
+# GENERATION ROUTE
+# -----------------------------------------------------------------------------
+
 @app.route("/generate/<kind>", methods=["POST"])
 def generate(kind):
+
     if kind not in ("mcq", "flashcards"):
         return redirect(url_for("home"))
 
     uploaded = request.files.get("notes")
 
     if not uploaded or not uploaded.filename:
+
         return render_template(
             "index.html",
             status="Please upload your notes first.",
@@ -653,64 +780,78 @@ def generate(kind):
         )
 
     try:
-        study_text = clean_study_text(read_file(uploaded))
 
-        if len(study_text) < 40:
+        study_text = clean_study_text(
+            read_file(uploaded)
+        )
+
+        if len(study_text) < 100:
+
             raise ValueError(
-                "Very little text could be extracted. "
-                "Scanned or image-only PDFs need OCR."
+                "Too little readable text was extracted. "
+                "If this is a scanned PDF, OCR is needed first."
             )
 
-        blocks = get_blocks(study_text)
-        definitions = find_definitions(blocks)
+        chunks = split_into_chunks(study_text)
 
-        if not definitions:
+        if not chunks:
+
             raise ValueError(
-                "No reliable concepts and explanations were found. "
-                "Try a text-based PDF or TXT file with explanatory content."
+                "No usable study content was found in this file."
             )
 
         if kind == "mcq":
-            questions = make_mcqs(definitions, 30)
+
+            questions, generation_errors = generate_mcqs(chunks)
 
             if not questions:
+
                 raise ValueError(
-                    "The document did not contain enough distinct "
-                    "concepts to create reliable four-option MCQs. "
-                    "Try a more detailed document."
+                    "The AI could not find enough well-supported MCQs "
+                    "in this PDF. Try a clearer or more detailed file. "
+                    "No weak questions were added."
                 )
 
             saved_results = {
-                "questions": questions,
+                "questions": questions[:30],
                 "cards": []
             }
 
             message = (
-                f"Generated {len(questions)} MCQs from "
-                f"{len(definitions)} extracted concepts."
+                f"Generated {len(saved_results['questions'])} "
+                "AI-based MCQs from your PDF."
             )
 
         else:
-            cards = make_flashcards(definitions)
+
+            cards, generation_errors = generate_flashcards(chunks)
+
+            if not cards:
+
+                raise ValueError(
+                    "The AI could not identify enough reliable "
+                    "flashcards in this PDF. Try a clearer or "
+                    "more detailed file."
+                )
 
             saved_results = {
                 "questions": [],
-                "cards": cards
+                "cards": cards[:50]
             }
 
             message = (
-                f"Generated {len(cards)} flashcards "
-                f"from extracted concepts."
+                f"Generated {len(saved_results['cards'])} "
+                "AI-based flashcards from your PDF."
             )
 
-        data_id = str(uuid.uuid4())
+        if generation_errors:
 
-        RESULTS_STORE[data_id] = {
-            "results": saved_results,
-            "mode": kind
-        }
+            message += (
+                " (Generation stopped early because of an API "
+                "limit or connection issue.)"
+            )
 
-        session["data_id"] = data_id
+        save_results(saved_results, kind)
 
         return render_template(
             "index.html",
@@ -720,6 +861,7 @@ def generate(kind):
         )
 
     except ValueError as error:
+
         return render_template(
             "index.html",
             status=str(error),
@@ -727,64 +869,87 @@ def generate(kind):
         )
 
     except Exception:
+
         app.logger.exception("Quiz generation failed")
 
         return render_template(
             "index.html",
             status=(
                 "Something went wrong while processing this file. "
-                "Please try another PDF or TXT file."
+                "Please try again."
             ),
             error=True
         )
 
 
+# -----------------------------------------------------------------------------
+# ANSWER CHECKING
+# -----------------------------------------------------------------------------
+
 @app.route("/answer", methods=["POST"])
 def answer():
-    data = get_saved_results().get("results", {})
+
+    saved = get_saved_results()
+    data = saved.get("results", {})
     questions = data.get("questions", [])
 
     try:
-        index = int(request.form.get("question_index", -1))
+        index = int(
+            request.form.get("question_index", -1)
+        )
     except (TypeError, ValueError):
         index = -1
 
     if 0 <= index < len(questions):
+
         chosen = request.form.get("choice", "")
 
-        if chosen in questions[index]["options"]:
+        if chosen in questions[index].get("options", []):
+
             questions[index]["selected"] = chosen
             questions[index]["checked"] = True
 
-            data_id = session.get("data_id")
-
-            if data_id in RESULTS_STORE:
-                RESULTS_STORE[data_id]["results"] = data
+            RESULTS_STORE[
+                session.get("data_id")
+            ]["results"] = data
 
     return redirect(url_for("home"))
 
+
+# -----------------------------------------------------------------------------
+# FLASHCARD REVEAL
+# -----------------------------------------------------------------------------
 
 @app.route("/reveal/<int:index>", methods=["POST"])
 def reveal(index):
-    data = get_saved_results().get("results", {})
+
+    saved = get_saved_results()
+    data = saved.get("results", {})
     cards = data.get("cards", [])
 
     if 0 <= index < len(cards):
+
         cards[index]["shown"] = not cards[index].get(
-            "shown", False
+            "shown",
+            False
         )
 
-        data_id = session.get("data_id")
-
-        if data_id in RESULTS_STORE:
-            RESULTS_STORE[data_id]["results"] = data
+        RESULTS_STORE[
+            session.get("data_id")
+        ]["results"] = data
 
     return redirect(url_for("home"))
 
 
+# -----------------------------------------------------------------------------
+# PDF DOWNLOAD
+# -----------------------------------------------------------------------------
+
 @app.route("/download-pdf")
 def download_pdf():
+
     saved = get_saved_results()
+
     data = saved.get("results", {})
     mode = saved.get("mode")
 
@@ -793,7 +958,7 @@ def download_pdf():
 
     buffer = io.BytesIO()
 
-    doc = SimpleDocTemplate(
+    document = SimpleDocTemplate(
         buffer,
         pagesize=A4,
         rightMargin=18 * mm,
@@ -804,7 +969,7 @@ def download_pdf():
 
     styles = getSampleStyleSheet()
 
-    title = ParagraphStyle(
+    title_style = ParagraphStyle(
         "QuizTitle",
         parent=styles["Title"],
         alignment=TA_CENTER,
@@ -812,67 +977,90 @@ def download_pdf():
         spaceAfter=14
     )
 
-    body = styles["BodyText"]
+    body_style = styles["BodyText"]
 
     story = [
-        Paragraph("CTPS Quiz Generator", title),
+        Paragraph(
+            "CTPS Quiz Generator",
+            title_style
+        ),
         Spacer(1, 5)
     ]
 
     if mode == "mcq":
+
         for number, question in enumerate(
-            data.get("questions", []), 1
+            data.get("questions", []),
+            1
         ):
+
             parts = [
+
                 Paragraph(
                     f"<b>Q{number}. "
                     f"{escape(question['question'])}</b>",
-                    body
+                    body_style
                 ),
+
                 Spacer(1, 5)
             ]
 
             for letter, option in zip(
-                "ABCD", question["options"]
+                "ABCD",
+                question["options"]
             ):
+
                 parts.append(
                     Paragraph(
                         f"{letter}. {escape(str(option))}",
-                        body
+                        body_style
                     )
                 )
 
             parts.extend([
+
                 Paragraph(
-                    "<font color='#287653'><b>"
-                    f"Correct answer: {escape(str(question['answer']))}"
-                    "</b></font>",
-                    body
+                    f"<font color='#287653'><b>"
+                    f"Correct answer: "
+                    f"{escape(str(question['answer']))}"
+                    f"</b></font>",
+                    body_style
                 ),
+
                 Spacer(1, 12)
             ])
 
-            story.append(KeepTogether(parts))
+            story.append(
+                KeepTogether(parts)
+            )
 
     else:
+
         for number, card in enumerate(
-            data.get("cards", []), 1
+            data.get("cards", []),
+            1
         ):
+
             story.append(
                 KeepTogether([
+
                     Paragraph(
-                        f"<b>{number}. {escape(str(card['front']))}</b>",
-                        body
+                        f"<b>{number}. "
+                        f"{escape(str(card['front']))}</b>",
+                        body_style
                     ),
+
                     Paragraph(
                         escape(str(card["back"])),
-                        body
+                        body_style
                     ),
+
                     Spacer(1, 12)
                 ])
             )
 
-    doc.build(story)
+    document.build(story)
+
     buffer.seek(0)
 
     return send_file(
@@ -883,5 +1071,26 @@ def download_pdf():
     )
 
 
+# -----------------------------------------------------------------------------
+# FILE SIZE ERROR
+# -----------------------------------------------------------------------------
+
+@app.errorhandler(413)
+def file_too_large(_error):
+
+    return render_template(
+        "index.html",
+        status=(
+            "The uploaded file is too large. "
+            "Please upload a file smaller than 20 MB."
+        ),
+        error=True
+    ), 413
+
+
+# -----------------------------------------------------------------------------
+# LOCAL DEVELOPMENT
+# -----------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=False)
