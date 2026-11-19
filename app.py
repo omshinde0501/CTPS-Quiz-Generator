@@ -1,10 +1,9 @@
-from flask import Flask, render_template, request, redirect, url_for, session, send_file, flash
+
+import os, io, json, uuid, random, tempfile, html
 import fitz
-import io
-import random
-import re
-import uuid
-from collections import OrderedDict
+from flask import Flask, render_template, request, redirect, url_for, session, send_file
+from google import genai
+from google.genai import types
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
@@ -13,215 +12,229 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, KeepTogethe
 from reportlab.lib.units import mm
 
 app = Flask(__name__)
-app.secret_key = "ctps-quiz-generator-change-this-key"
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "ctps-quiz-generator-change-this-key")
+app.config["MAX_CONTENT_LENGTH"] = 18 * 1024 * 1024
 RESULTS_STORE = {}
+GEMINI_MODEL = "gemini-3.8-flash"
+
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    "options": {"type": "array", "items": {"type": "string"}},
+                    "answer": {"type": "string"},
+                    "explanation": {"type": "string"}
+                },
+                "required": ["question", "options", "answer", "explanation"]
+            }
+        },
+        "flashcards": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "front": {"type": "string"},
+                    "back": {"type": "string"}
+                },
+                "required": ["front", "back"]
+            }
+        }
+    },
+    "required": ["questions", "flashcards"]
+}
 
 def get_saved_results():
     return RESULTS_STORE.get(session.get("data_id"), {})
 
-# Read TXT files or extract selectable text from PDFs.
-def read_file(file):
-    name = file.filename.lower()
-    data = file.read()
+def read_upload(file):
+    name, data = (file.filename or "").lower(), file.read()
+    if not data:
+        raise ValueError("The uploaded file is empty.")
     if name.endswith(".txt"):
-        return data.decode("utf-8", errors="ignore")
+        text = data.decode("utf-8-sig", errors="replace")
+        if len(text.strip()) < 40:
+            raise ValueError("The TXT file contains too little study material.")
+        return {"kind": "txt", "content": text}
     if name.endswith(".pdf"):
-        document = fitz.open(stream=data, filetype="pdf")
-        return "\n".join(page.get_text("text", sort=True) for page in document)
-    raise ValueError("Please choose a PDF or TXT file.")
+        try:
+            doc = fitz.open(stream=data, filetype="pdf")
+            if doc.is_encrypted or not doc.page_count:
+                raise ValueError("The PDF is empty or password-protected.")
+            doc.close()
+        except ValueError:
+            raise
+        except Exception:
+            raise ValueError("The uploaded PDF is invalid or damaged.")
+        return {"kind": "pdf", "content": data}
+    raise ValueError("Please upload a PDF or TXT file.")
 
-# Identify headings, instructions and page decorations.
-def is_unwanted_line(line):
-    text = line.strip()
-    lower = text.lower()
-    if len(text) < 3:
-        return True
-    if re.match(r"^(unit|chapter|module|semester|subject)\s*[-:\d]", text, re.I):
-        return True
-    if re.match(r"^(unit|chapter|module)\s+\d+", text, re.I):
-        return True
-    headings = r"^(how to use these notes|how to use|instructions?|learning objectives|contents|table of contents|index|references|bibliography|acknowledgement)s?\s*[:.]?$"
-    if re.match(headings, text, re.I):
-        return True
-    if re.match(r"^(read|use|refer to|study|follow|go through|these notes|this unit|in this unit|at the end of this unit)\b", lower):
-        return True
-    if re.match(r"^(page\s*)?\d+(\s*of\s*\d+)?$", text, re.I):
-        return True
-    if re.match(r"^(quiz generator|generated notes|study notes)$", text, re.I):
-        return True
-    if len(text) < 90 and re.fullmatch(r"[A-Z0-9\s&(),./:-]+", text) and re.search(r"[A-Z]", text) and not re.search(r"[.!?]", text):
-        return True
-    return False
+def generate_material(upload, kind):
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        raise ValueError("Gemini API key is missing. Add GEMINI_API_KEY in Render.")
 
-# Remove unwanted lines but keep useful line boundaries.
-def clean_study_text(text):
-    useful = []
-    for line in text.splitlines():
-        line = re.sub(r"\s+", " ", line).strip()
-        if not is_unwanted_line(line):
-            useful.append(line)
-    return "\n".join(useful)
+    if kind == "mcq":
+        prompt = """Create up to 20 high-quality MCQs strictly from the uploaded material.
+Each question must have exactly four distinct options and one correct answer.
+Use plausible, relevant distractors. Questions must be clear, logical and non-repetitive.
+Include a short explanation. Do not invent facts or use outside knowledge.
+Generate fewer questions rather than poor ones. Return an empty flashcards array."""
+    else:
+        prompt = """Create up to 40 useful flashcards from the uploaded material.
+Each card must have a clear question or term on the front and an accurate,
+concise answer on the back. Cover important concepts without repetition.
+Do not invent facts or use outside knowledge. Return an empty questions array."""
 
-# Split the cleaned notes into short statements.
-def get_sentences(text):
-    parts = re.split(r"(?<=[.!?])\s+|\n+", text)
-    return [re.sub(r"\s+", " ", p).strip() for p in parts
-            if 25 < len(p.strip()) < 350 and not is_unwanted_line(p.strip())]
+    client = genai.Client(api_key=key)
+    uploaded, temp = None, None
 
-# Extract definitions written as 'Term: meaning' or common definition phrases.
-def find_definitions(sentences):
-    patterns = [
-        re.compile(r"^(.{2,65}?)\s+(?:is defined as|are defined as|is referred to as|are referred to as|refers to|refer to|is known as|are known as|is called|are called|is also called|are also called|is a type of|are a type of|is the process of|are the process of|is an?|are an?)\s+(.+)$", re.I),
-        re.compile(r"^(.{2,65}?)\s*:\s*(.{15,})$", re.I),
-        re.compile(r"^(.{2,65}?)\s+(?:means|denotes|represents|is used for|are used for|is used to|are used to)\s+(.+)$", re.I)
-    ]
-    found = []
-    for sentence in sentences:
-        line = re.sub(r"^[•\-*]\s*", "", sentence).strip()
-        if is_unwanted_line(line):
-            continue
-        for pattern in patterns:
-            match = pattern.match(line)
-            if not match:
+    try:
+        if upload["kind"] == "pdf":
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+                f.write(upload["content"])
+                temp = f.name
+            uploaded = client.files.upload(file=temp)
+            contents = [prompt, uploaded]
+        else:
+            contents = [prompt, "\nSTUDY MATERIAL:\n", upload["content"][:70000]]
+
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_json_schema=SCHEMA,
+                temperature=0.2,
+                max_output_tokens=8192
+            )
+        )
+        if not response.text:
+            raise ValueError("Gemini returned an empty response.")
+        return json.loads(response.text)
+
+    except ValueError:
+        raise
+    except Exception as e:
+        msg = str(e).lower()
+        if any(x in msg for x in ["429", "quota", "resource_exhausted"]):
+            raise ValueError("Gemini free usage limit reached. Please try again later.")
+        if any(x in msg for x in ["401", "403", "api key", "permission"]):
+            raise ValueError("Gemini authentication failed. Check your API key.")
+        if "404" in msg:
+            raise ValueError("Gemini model unavailable. Check the model name or API access.")
+        print("GEMINI ERROR:", e)
+        raise ValueError("Generation failed. Please try another file.")
+    finally:
+        if uploaded:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:
+                pass
+        if temp and os.path.exists(temp):
+            os.remove(temp)
+        try:
+            client.close()
+        except Exception:
+            pass
+
+def prepare_mcqs(items):
+    result, seen = [], set()
+    for q in items[:20]:
+        try:
+            question = str(q["question"]).strip()
+            answer = str(q["answer"]).strip()
+            options = [str(x).strip() for x in q["options"] if str(x).strip()]
+            if len(options) != 4 or len({x.casefold() for x in options}) != 4:
                 continue
-            term, meaning = match.group(1).strip(), match.group(2).strip()
-            if (len(term.split()) <= 8 and len(meaning) > 12 and not is_unwanted_line(term)
-                    and not re.match(r"^(how to use|unit|chapter|module|instructions?)\b", term, re.I)):
-                found.append({"term": re.sub(r"[,;:]+$", "", term),
-                              "meaning": re.sub(r"[.!?]+$", "", meaning),
-                              "source": sentence})
-            break
-    # Keep the first useful definition for each term.
-    unique = OrderedDict()
-    for item in found:
-        key = item["term"].casefold()
-        if key not in unique:
-            unique[key] = item
-    return list(unique.values())
-
-# Put related concepts into broad groups for more relevant MCQ options.
-def get_category(item):
-    text = (item["term"] + " " + item["meaning"]).lower()
-    groups = {
-        "programming_languages": ["python", "java", "javascript", "c++", "c language", "sql", "pascal", "prolog", "haskell"],
-        "programming_methods": ["procedural", "object-oriented", "functional", "logic programming", "declarative", "concurrent", "parallel"],
-        "software_tools": ["compiler", "interpreter", "linker", "loader", "assembler", "debugger"],
-        "program_errors": ["syntax error", "semantic error", "type error", "linking error", "runtime error", "logical error"],
-        "logic_gates": ["and gate", "or gate", "not gate", "nand gate", "nor gate", "xor gate", "xnor gate"],
-        "data_concepts": ["variable", "constant", "data type", "array", "string", "integer", "float", "boolean", "operator"],
-        "control_structures": ["if statement", "if-else", "loop", "for loop", "while loop", "switch", "iteration", "selection"]
-    }
-    for category, terms in groups.items():
-        if any(term in text for term in terms):
-            return category
-    return "other"
-
-def word_similarity(first, second):
-    a = set(re.findall(r"[a-z]{3,}", first["meaning"].lower()))
-    b = set(re.findall(r"[a-z]{3,}", second["meaning"].lower()))
-    stop = {"the", "and", "for", "that", "this", "with", "from", "into", "are", "which", "used"}
-    a -= stop
-    b -= stop
-    return len(a & b) / max(1, len(a | b))
-
-# Generate four-option questions only when three plausible related terms exist.
-def make_mcqs(definitions, limit=30):
-    result = []
-    for item in definitions:
-        if len(result) >= limit:
-            break
-        category = get_category(item)
-        candidates = []
-        for other in definitions:
-            if other["term"].casefold() == item["term"].casefold():
+            correct = next((x for x in options if x.casefold() == answer.casefold()), None)
+            if not correct or len(question) < 10 or question.casefold() in seen:
                 continue
-            same_group = category != "other" and get_category(other) == category
-            similar = word_similarity(item, other) >= 0.12
-            if same_group or similar:
-                candidates.append(other)
-        candidates.sort(key=lambda x: word_similarity(item, x), reverse=True)
-        distractors = []
-        for candidate in candidates:
-            if candidate["term"].casefold() not in {d.casefold() for d in distractors}:
-                distractors.append(candidate["term"])
-            if len(distractors) == 3:
-                break
-        if len(distractors) != 3:
+            seen.add(question.casefold())
+            random.shuffle(options)
+            result.append({
+                "question": question, "answer": correct, "options": options,
+                "explanation": str(q.get("explanation", "")),
+                "selected": None, "checked": False
+            })
+        except (KeyError, TypeError):
             continue
-        options = [item["term"]] + distractors
-        random.shuffle(options)
-        result.append({
-            "question": "Which term matches this definition? " + item["meaning"] + " ________",
-            "answer": item["term"],
-            "options": options,
-            "selected": None,
-            "checked": False
-        })
     return result
 
-def make_flashcards(definitions):
-    return [{"front": item["term"], "back": item["meaning"], "shown": False}
-            for item in definitions[:50]]
+def prepare_cards(items):
+    result, seen = [], set()
+    for card in items[:40]:
+        try:
+            front, back = str(card["front"]).strip(), str(card["back"]).strip()
+            if not front or not back or front.casefold() in seen:
+                continue
+            seen.add(front.casefold())
+            result.append({"front": front, "back": back, "shown": False})
+        except (KeyError, TypeError):
+            continue
+    return result
 
-@app.route("/", methods=["GET"])
+@app.route("/")
 def home():
     saved = get_saved_results()
-    return render_template("index.html", results=saved.get("results"),
-                           mode=saved.get("mode"), status=None)
+    return render_template("index.html", results=saved.get("results"), mode=saved.get("mode"), status=None)
 
 @app.route("/generate/<kind>", methods=["POST"])
 def generate(kind):
     if kind not in ("mcq", "flashcards"):
         return redirect(url_for("home"))
-    uploaded = request.files.get("notes")
-    if not uploaded or not uploaded.filename:
+    file = request.files.get("notes")
+    if not file or not file.filename:
         return render_template("index.html", status="Please upload your notes first.", error=True)
     try:
-        raw_text = read_file(uploaded)
-        study_text = clean_study_text(raw_text)
-        if len(study_text) < 40:
-            raise ValueError("Very little text could be extracted. Scanned/image-only PDFs need OCR before uploading.")
-        definitions = find_definitions(get_sentences(study_text))
-        if not definitions:
-            raise ValueError("No clear study definitions found. Try notes with phrases like 'refers to', 'is known as', 'means', or 'Term: meaning'.")
+        upload = read_upload(file)
+        generated = generate_material(upload, kind)
         if kind == "mcq":
-            questions = make_mcqs(definitions, 30)
+            questions = prepare_mcqs(generated.get("questions", []))
             if not questions:
-                raise ValueError("Not enough related technical terms were found to create reliable four-option MCQs. Try notes with more definitions from the same topic.")
-            saved_results = {"questions": questions, "cards": []}
-            mode = "mcq"
-            message = f"Generated {len(questions)} MCQs from {len(definitions)} valid definitions."
+                raise ValueError("No valid MCQs could be generated. Try a more detailed file.")
+            results = {"questions": questions, "cards": []}
+            message = f"Generated {len(questions)} AI-powered MCQs."
         else:
-            cards = make_flashcards(definitions)
-            saved_results = {"questions": [], "cards": cards}
-            mode = "flashcards"
-            message = f"Generated {len(cards)} flashcards from filtered study content."
+            cards = prepare_cards(generated.get("flashcards", []))
+            if not cards:
+                raise ValueError("No useful flashcards could be generated. Try another file.")
+            results = {"questions": [], "cards": cards}
+            message = f"Generated {len(cards)} AI-powered flashcards."
+
         data_id = str(uuid.uuid4())
-        RESULTS_STORE[data_id] = {"results": saved_results, "mode": mode}
+        RESULTS_STORE[data_id] = {"results": results, "mode": kind}
         session["data_id"] = data_id
-        return render_template("index.html", results=saved_results, mode=kind, status=message)
-    except Exception as error:
-        return render_template("index.html", status=str(error), error=True)
+        return render_template("index.html", results=results, mode=kind, status=message)
+    except Exception as e:
+        print("GENERATION ERROR:", e)
+        return render_template("index.html", status=str(e), error=True)
 
 @app.route("/answer", methods=["POST"])
 def answer():
-    data = get_saved_results().get("results", {})
+    saved = get_saved_results()
+    data = saved.get("results", {})
     questions = data.get("questions", [])
     try:
-        index = int(request.form.get("question_index", -1))
+        i = int(request.form.get("question_index", -1))
     except ValueError:
-        index = -1
-    if 0 <= index < len(questions):
-        chosen = request.form.get("choice", "")
-        if chosen in questions[index]["options"]:
-            questions[index]["selected"] = chosen
-            questions[index]["checked"] = True
+        i = -1
+    if 0 <= i < len(questions):
+        choice = request.form.get("choice", "")
+        if choice in questions[i]["options"]:
+            questions[i]["selected"] = choice
+            questions[i]["checked"] = True
             RESULTS_STORE[session.get("data_id")]["results"] = data
     return redirect(url_for("home"))
 
 @app.route("/reveal/<int:index>", methods=["POST"])
 def reveal(index):
-    data = get_saved_results().get("results", {})
+    saved = get_saved_results()
+    data = saved.get("results", {})
     cards = data.get("cards", [])
     if 0 <= index < len(cards):
         cards[index]["shown"] = not cards[index].get("shown", False)
@@ -230,10 +243,11 @@ def reveal(index):
 
 @app.route("/download-pdf")
 def download_pdf():
-    data = get_saved_results().get("results", {})
-    mode = get_saved_results().get("mode")
+    saved = get_saved_results()
+    data, mode = saved.get("results", {}), saved.get("mode")
     if not data or mode not in ("mcq", "flashcards"):
         return redirect(url_for("home"))
+
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=18*mm, leftMargin=18*mm,
                             topMargin=18*mm, bottomMargin=18*mm)
@@ -242,21 +256,34 @@ def download_pdf():
                            textColor=colors.HexColor("#174b86"), spaceAfter=14)
     body = styles["BodyText"]
     story = [Paragraph("CTPS Quiz Generator", title), Spacer(1, 5)]
+
     if mode == "mcq":
-        for number, q in enumerate(data.get("questions", []), 1):
-            parts = [Paragraph(f"<b>Q{number}. {q['question']}</b>", body), Spacer(1, 5)]
+        for i, q in enumerate(data.get("questions", []), 1):
+            parts = [Paragraph(f"<b>Q{i}. {html.escape(q['question'])}</b>", body), Spacer(1, 5)]
             for letter, option in zip("ABCD", q["options"]):
-                parts.append(Paragraph(f"{letter}. {option}", body))
-            parts.extend([Paragraph(f"<font color='#287653'><b>Correct answer: {q['answer']}</b></font>", body), Spacer(1, 12)])
+                parts.append(Paragraph(f"{letter}. {html.escape(option)}", body))
+            parts.append(Paragraph(
+                f"<font color='#287653'><b>Correct answer: {html.escape(q['answer'])}</b></font>", body
+            ))
+            if q.get("explanation"):
+                parts.append(Paragraph("<b>Explanation:</b> " + html.escape(q["explanation"]), body))
+            parts.append(Spacer(1, 12))
             story.append(KeepTogether(parts))
     else:
-        for number, card in enumerate(data.get("cards", []), 1):
-            story.append(KeepTogether([Paragraph(f"<b>{number}. {card['front']}</b>", body),
-                                       Paragraph(card["back"], body), Spacer(1, 12)]))
+        for i, card in enumerate(data.get("cards", []), 1):
+            story.append(KeepTogether([
+                Paragraph(f"<b>{i}. {html.escape(card['front'])}</b>", body),
+                Paragraph(html.escape(card["back"]), body), Spacer(1, 12)
+            ]))
+
     doc.build(story)
     buffer.seek(0)
     return send_file(buffer, as_attachment=True, download_name="CTPS_Practice_Material.pdf",
                      mimetype="application/pdf")
 
+@app.errorhandler(413)
+def file_too_large(error):
+    return render_template("index.html", status="File too large. Upload a file below 18 MB.", error=True), 413
+
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
