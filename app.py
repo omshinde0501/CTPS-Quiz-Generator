@@ -28,6 +28,11 @@ app.secret_key = os.environ.get("SECRET_KEY", "ctps-quiz-generator-local-secret-
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024  # 20 MB upload limit
 app.logger.setLevel(logging.INFO)
 
+CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
+CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
+CLOUDFLARE_MODEL = os.environ.get("CLOUDFLARE_MODEL", "@cf/meta/llama-3.3-70b-instruct-fp8-fast").strip()
+CLOUDFLARE_API_URL = "https://api.cloudflare.com/client/v4/accounts/{}/ai/run/{}"
+
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b").strip()
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -168,6 +173,71 @@ def normalize_for_match(text):
 
 
 # -----------------------------------------------------------------------------
+# Cloudflare Workers AI primary provider
+# -----------------------------------------------------------------------------
+
+def call_cloudflare(system_prompt, user_prompt, schema, schema_name):
+    """Call Cloudflare Workers AI and parse its JSON response."""
+    if not CLOUDFLARE_API_TOKEN or not CLOUDFLARE_ACCOUNT_ID:
+        raise ValueError("Cloudflare credentials are missing in Render Environment Variables.")
+
+    endpoint = CLOUDFLARE_API_URL.format(
+        CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_MODEL
+    )
+    payload = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": schema
+        },
+        "temperature": 0.2,
+        "max_tokens": 3500
+    }
+    request_data = json.dumps(payload).encode("utf-8")
+    api_request = urllib.request.Request(
+        endpoint,
+        data=request_data,
+        headers={
+            "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
+            "Content-Type": "application/json",
+            "User-Agent": "CTPS-Quiz-Generator/1.0"
+        },
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(api_request, timeout=180) as response:
+            response_body = response.read().decode("utf-8", errors="replace")
+        response_json = json.loads(response_body)
+        if response_json.get("success") is False:
+            raise ValueError(str(response_json.get("errors") or "Cloudflare request failed"))
+        result = response_json.get("result", {})
+        content = result.get("response") if isinstance(result, dict) else None
+        if isinstance(content, dict):
+            return content
+        if not content:
+            raise ValueError("Cloudflare returned an empty response.")
+        # Some model responses wrap JSON in Markdown fences; strip only the fences.
+        content = str(content).strip()
+        content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.I)
+        return json.loads(content)
+
+    except urllib.error.HTTPError as error:
+        details = error.read().decode("utf-8", errors="replace")
+        app.logger.error("Cloudflare AI HTTP %s: %s", error.code, details[:1500])
+        raise ValueError(f"Cloudflare Workers AI returned HTTP {error.code}.")
+    except urllib.error.URLError as error:
+        app.logger.error("Cloudflare AI connection error: %s", error)
+        raise ValueError("Could not connect to Cloudflare Workers AI.")
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        app.logger.exception("Unexpected Cloudflare AI response")
+        raise ValueError("Cloudflare returned an unreadable response.")
+
+
+# -----------------------------------------------------------------------------
 # Groq structured-output integration
 # -----------------------------------------------------------------------------
 
@@ -284,6 +354,37 @@ def call_groq(system_prompt, user_prompt, schema, schema_name):
         raise ValueError("Groq returned an unreadable response. Please try again.")
 
 
+def call_ai(system_prompt, user_prompt, schema, schema_name):
+    """Use Cloudflare first; automatically fall back to Groq if needed."""
+    cloudflare_error = None
+    if CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID:
+        try:
+            return call_cloudflare(system_prompt, user_prompt, schema, schema_name)
+        except ValueError as error:
+            cloudflare_error = str(error)
+            app.logger.warning("Cloudflare failed; trying Groq fallback: %s", cloudflare_error)
+
+    if GROQ_API_KEY:
+        try:
+            return call_groq(system_prompt, user_prompt, schema, schema_name)
+        except ValueError as groq_error:
+            if cloudflare_error:
+                raise ValueError(
+                    "Cloudflare Workers AI and Groq both failed. "
+                    f"Cloudflare: {cloudflare_error} Groq: {groq_error}"
+                )
+            raise
+
+    if cloudflare_error:
+        raise ValueError(
+            f"Cloudflare Workers AI failed ({cloudflare_error}) and no GROQ_API_KEY is configured."
+        )
+    raise ValueError(
+        "No AI provider is configured. Add CLOUDFLARE_API_TOKEN and "
+        "CLOUDFLARE_ACCOUNT_ID in Render Environment Variables."
+    )
+
+
 # -----------------------------------------------------------------------------
 # AI generation and quality checks
 # -----------------------------------------------------------------------------
@@ -342,7 +443,7 @@ def generate_mcqs(chunks):
             f"STUDY TEXT (section {chunk_number}):\n{chunk}"
         )
         try:
-            result = call_groq(
+            result = call_ai(
                 MCQ_SYSTEM_PROMPT, prompt, MCQ_SCHEMA, "quiz_questions"
             )
         except ValueError as error:
@@ -408,7 +509,7 @@ def generate_flashcards(chunks):
             f"STUDY TEXT (section {chunk_number}):\n{chunk}"
         )
         try:
-            result = call_groq(
+            result = call_ai(
                 FLASHCARD_SYSTEM_PROMPT, prompt, FLASHCARD_SCHEMA, "study_flashcards"
             )
         except ValueError as error:
